@@ -84,6 +84,16 @@ except Exception as e:
 mt5_clients = {}
 manual_overrides = {}
 
+# Centralized Risk Parameters
+max_drawdown_percent = 5.0
+emergency_kill_switch = False
+
+class RiskSettingsPayload(BaseModel):
+    max_drawdown_percent: float
+
+class KillSwitchPayload(BaseModel):
+    active: bool
+
 class OverridePayload(BaseModel):
     ticker: str
     action: str
@@ -894,27 +904,48 @@ async def get_mt5_signals(
                 """)
             ).fetchall()
 
+        # Check drawdown and emergency kill switch
+        acc_stats = conn.execute(text("SELECT SUM(balance), SUM(equity) FROM broker_accounts")).fetchone()
+        current_drawdown_pct = 0.0
+        if acc_stats and acc_stats[0] and float(acc_stats[0]) > 0:
+            total_bal = float(acc_stats[0])
+            total_eq = float(acc_stats[1])
+            if total_bal > total_eq:
+                current_drawdown_pct = ((total_bal - total_eq) / total_bal) * 100.0
+        
+        is_risk_triggered = (current_drawdown_pct > max_drawdown_percent) or emergency_kill_switch
+        risk_reason = ""
+        if emergency_kill_switch:
+            risk_reason = "EMERGENCY KILL-SWITCH ATTIVATO DA DASHBOARD"
+        elif current_drawdown_pct > max_drawdown_percent:
+            risk_reason = f"DRAWDOWN ATTUALE ({current_drawdown_pct:.2f}%) SUPERA IL LIMITE ({max_drawdown_percent:.2f}%)"
+
         signals = []
         for r_ticker, r_signal, r_reason, r_price, r_gen, r_adx, r_atr, r_vol in rows:
-            # Check for manual overrides
-            active_signal = r_signal
-            active_reason = r_reason
-            
-            clean_ticker = r_ticker.split(".")[0].replace("=X", "").replace("^", "")
-            override_key = None
-            if r_ticker in manual_overrides:
-                override_key = r_ticker
-            elif clean_ticker in manual_overrides:
-                override_key = clean_ticker
+            # Check for manual overrides or risk trigger
+            if is_risk_triggered:
+                active_signal = "CLOSE_ALL"
+                active_reason = f"RISCHIO ATTIVATO: {risk_reason}"
             else:
-                for k in manual_overrides.keys():
-                    if k.split(".")[0].replace("=X", "").replace("^", "") == clean_ticker:
-                        override_key = k
-                        break
-            
-            if override_key:
-                active_signal = manual_overrides[override_key]["action"]
-                active_reason = f"OVERRIDE MANUALE DALLA DASHBOARD WEB ({manual_overrides[override_key]['timestamp']})"
+                active_signal = r_signal
+                active_reason = r_reason
+                
+                clean_ticker = r_ticker.split(".")[0].replace("=X", "").replace("^", "")
+                override_key = None
+                if r_ticker in manual_overrides:
+                    override_key = r_ticker
+                elif clean_ticker in manual_overrides:
+                    override_key = clean_ticker
+                else:
+                    for k in manual_overrides.keys():
+                        if k.split(".")[0].replace("=X", "").replace("^", "") == clean_ticker:
+                            override_key = k
+                            break
+                
+                if override_key:
+                    active_signal = manual_overrides[override_key]["action"]
+                    active_reason = f"OVERRIDE MANUALE DALLA DASHBOARD WEB ({manual_overrides[override_key]['timestamp']})"
+
 
             # Calculate ATR for SL/TP
             atr_prices = conn.execute(
@@ -1097,3 +1128,36 @@ def get_recommendations_history(ticker: str):
             )
         )
     return history
+
+@app.get("/api/mt5/risk")
+def get_risk_settings():
+    # Calculate current aggregate drawdown
+    with engine.connect() as conn:
+        acc_stats = conn.execute(text("SELECT SUM(balance), SUM(equity) FROM broker_accounts")).fetchone()
+        current_drawdown_pct = 0.0
+        if acc_stats and acc_stats[0] and float(acc_stats[0]) > 0:
+            total_bal = float(acc_stats[0])
+            total_eq = float(acc_stats[1])
+            if total_bal > total_eq:
+                current_drawdown_pct = ((total_bal - total_eq) / total_bal) * 100.0
+                
+    return {
+        "max_drawdown_percent": max_drawdown_percent,
+        "emergency_kill_switch": emergency_kill_switch,
+        "current_drawdown_percent": round(current_drawdown_pct, 2)
+    }
+
+@app.post("/api/mt5/risk")
+async def update_risk_settings(payload: RiskSettingsPayload):
+    global max_drawdown_percent
+    max_drawdown_percent = payload.max_drawdown_percent
+    await manager.broadcast({"type": "risk_update"})
+    return {"status": "success", "max_drawdown_percent": max_drawdown_percent}
+
+@app.post("/api/mt5/risk/kill-switch")
+async def toggle_kill_switch(payload: KillSwitchPayload):
+    global emergency_kill_switch
+    emergency_kill_switch = payload.active
+    await manager.broadcast({"type": "risk_update"})
+    return {"status": "success", "emergency_kill_switch": emergency_kill_switch}
+

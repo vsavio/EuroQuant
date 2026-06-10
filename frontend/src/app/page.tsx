@@ -130,6 +130,13 @@ export default function TerminalDashboard() {
   const [screenerTab, setScreenerTab] = useState<"stocks" | "forex">("stocks");
   const [brokerAccounts, setBrokerAccounts] = useState<BrokerAccount[]>([]);
 
+  // Risk control state
+  const [maxDrawdownPercent, setMaxDrawdownPercent] = useState(5.0);
+  const [emergencyKillSwitch, setEmergencyKillSwitch] = useState(false);
+  const [currentDrawdownPercent, setCurrentDrawdownPercent] = useState(0.0);
+  const [showRiskModal, setShowRiskModal] = useState(false);
+  const [riskModalValue, setRiskModalValue] = useState("5.0");
+
   useEffect(() => {
     const updateTime = () => {
       const now = new Date();
@@ -195,6 +202,16 @@ export default function TerminalDashboard() {
       if (accountsRes.ok) {
         const data = await accountsRes.json();
         setBrokerAccounts(data);
+      }
+
+      // Fetch risk settings
+      const riskRes = await fetch(`${API_URL}/api/mt5/risk`);
+      if (riskRes.ok) {
+        const data = await riskRes.json();
+        setMaxDrawdownPercent(data.max_drawdown_percent);
+        setEmergencyKillSwitch(data.emergency_kill_switch);
+        setCurrentDrawdownPercent(data.current_drawdown_percent);
+        setRiskModalValue(String(data.max_drawdown_percent));
       }
     } catch (error) {
       console.error("Error fetching dashboard data:", error);
@@ -325,6 +342,39 @@ export default function TerminalDashboard() {
       setTimeout(() => setSyncing(false), 3000);
     }
   };
+
+  const toggleEmergencyKillSwitch = async () => {
+    const nextState = !emergencyKillSwitch;
+    try {
+      const res = await fetch(`${API_URL}/api/mt5/risk/kill-switch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ active: nextState })
+      });
+      if (res.ok) {
+        setEmergencyKillSwitch(nextState);
+      }
+    } catch (err) {
+      console.error("Failed to toggle emergency kill-switch:", err);
+    }
+  };
+
+  const saveRiskSettings = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/mt5/risk`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_drawdown_percent: Number(riskModalValue) })
+      });
+      if (res.ok) {
+        setMaxDrawdownPercent(Number(riskModalValue));
+        setShowRiskModal(false);
+      }
+    } catch (err) {
+      console.error("Failed to save risk settings:", err);
+    }
+  };
+
 
   const runBacktest = async () => {
     if (!selectedTicker) return;
@@ -509,20 +559,56 @@ export default function TerminalDashboard() {
           </div>
         )}
 
-        {/* Sync Trigger */}
-        <button
-          onClick={triggerSync}
-          disabled={syncing}
-          className={`px-4 py-2 text-xs font-bold uppercase rounded border transition flex items-center gap-2 ${
-            syncing 
-              ? "bg-terminal-card border-terminal-border text-terminal-muted cursor-not-allowed" 
-              : "bg-terminal-accent/10 border-terminal-accent text-terminal-accent hover:bg-terminal-accent hover:text-black shadow-[0_0_8px_rgba(255,153,0,0.2)]"
-          }`}
-        >
-          <RefreshCw className={`h-4 w-4 ${syncing ? "animate-spin" : ""}`} />
-          {syncing ? "WORKER RUNNING..." : "RUN SYNC ENGINE"}
-        </button>
+        <div className="flex items-center gap-2">
+          {/* Risk Limit Controller */}
+          <button
+            onClick={() => setShowRiskModal(true)}
+            className="px-3 py-2 text-[10px] font-bold uppercase rounded border border-terminal-border bg-terminal-card text-slate-300 hover:border-terminal-accent hover:text-terminal-accent transition flex items-center gap-1.5"
+          >
+            🛡️ RISCHIO: {maxDrawdownPercent}% DD
+          </button>
+
+          {/* Emergency Kill Switch */}
+          <button
+            onClick={toggleEmergencyKillSwitch}
+            className={`px-3 py-2 text-[10px] font-bold uppercase rounded border transition flex items-center gap-1.5 ${
+              emergencyKillSwitch 
+                ? "bg-rose-600 border-rose-500 text-white hover:bg-rose-700 animate-pulse shadow-[0_0_12px_rgba(239,68,68,0.5)]" 
+                : "bg-terminal-card border-rose-950 text-rose-500 hover:bg-rose-950/30 hover:border-rose-700 transition"
+            }`}
+          >
+            🚨 {emergencyKillSwitch ? "BLOCCO ATTIVO" : "KILL-SWITCH"}
+          </button>
+
+          {/* Sync Trigger */}
+          <button
+            onClick={triggerSync}
+            disabled={syncing}
+            className={`px-3 py-2 text-[10px] font-bold uppercase rounded border transition flex items-center gap-1.5 ${
+              syncing 
+                ? "bg-terminal-card border-terminal-border text-terminal-muted cursor-not-allowed" 
+                : "bg-terminal-accent/10 border-terminal-accent text-terminal-accent hover:bg-terminal-accent hover:text-black shadow-[0_0_8px_rgba(255,153,0,0.2)]"
+            }`}
+          >
+            <RefreshCw className={`h-3 w-3 ${syncing ? "animate-spin" : ""}`} />
+            {syncing ? "RUNNING..." : "RUN SYNC"}
+          </button>
+        </div>
       </header>
+
+      {/* Risk Alert Banner */}
+      {(emergencyKillSwitch || currentDrawdownPercent > maxDrawdownPercent) && (
+        <div className="bg-rose-950/85 border border-rose-600 text-rose-200 px-4 py-3 text-xs mb-3 flex flex-col md:flex-row md:items-center justify-between gap-3 rounded shadow-lg animate-pulse">
+          <div className="flex items-center gap-2 font-black tracking-wider uppercase text-rose-400">
+            <span>⚠️ BLOCCO OPERATIVO ATTIVO (CLOSE_ALL)</span>
+          </div>
+          <div>
+            {emergencyKillSwitch 
+              ? "L'interruttore di emergenza globale (Kill-Switch) è attivo." 
+              : `Il drawdown massimo consentito (${maxDrawdownPercent}%) è stato superato (drawdown corrente: ${currentDrawdownPercent}%).`} Tutti gli EA riceveranno l'ordine di chiusura immediata delle posizioni.
+          </div>
+        </div>
+      )}
 
       {/* Sync Status Overlay */}
       {syncStatus && (
@@ -1620,6 +1706,81 @@ if (res > 0) {
               <span>Generato il (Zulu): {stockDetail && stockDetail.history.length > 0 ? stockDetail.history[stockDetail.history.length-1].date + " Z" : ""}</span>
             </div>
             
+          </div>
+        </div>
+      )}
+
+      {/* Risk Configuration Modal */}
+      {showRiskModal && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-terminal-card border border-terminal-border rounded-lg shadow-2xl max-w-md w-full overflow-hidden">
+            {/* Modal Header */}
+            <div className="p-4 border-b border-terminal-border bg-terminal-bg flex justify-between items-center">
+              <h3 className="text-terminal-accent text-xs font-black tracking-wider uppercase flex items-center gap-2">
+                🛡️ CONFIGURAZIONE PARAMETRI DI RISCHIO
+              </h3>
+              <button 
+                onClick={() => setShowRiskModal(false)}
+                className="text-slate-400 hover:text-white transition text-xs font-bold"
+              >
+                ✕
+              </button>
+            </div>
+            
+            {/* Modal Body */}
+            <div className="p-5 space-y-4">
+              <div className="space-y-1">
+                <label className="text-[10px] text-slate-400 font-bold uppercase block">
+                  Drawdown Massimo Consentito (%)
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0.5"
+                    max="50.0"
+                    value={riskModalValue}
+                    onChange={(e) => setRiskModalValue(e.target.value)}
+                    className="flex-1 bg-terminal-bg border border-terminal-border rounded px-3 py-2 text-xs text-white font-mono focus:border-terminal-accent focus:outline-none"
+                  />
+                  <span className="text-xs text-slate-300 flex items-center font-bold font-mono">%</span>
+                </div>
+                <p className="text-[10px] text-terminal-muted leading-snug">
+                  Se il drawdown totale degli account connessi supera questo valore, tutti gli EA connessi eseguiranno la chiusura automatica di emergenza delle posizioni.
+                </p>
+              </div>
+
+              <div className="bg-terminal-bg/50 border border-terminal-border/40 p-3 rounded space-y-1.5 text-[11px]">
+                <div className="flex justify-between text-slate-400">
+                  <span>Drawdown Aggregato Corrente:</span>
+                  <span className={`font-mono font-bold ${currentDrawdownPercent > maxDrawdownPercent ? "text-rose-400" : "text-emerald-400"}`}>
+                    {currentDrawdownPercent.toFixed(2)}%
+                  </span>
+                </div>
+                <div className="flex justify-between text-slate-400">
+                  <span>Stato Operativo:</span>
+                  <span className={`font-bold ${currentDrawdownPercent > maxDrawdownPercent || emergencyKillSwitch ? "text-rose-400 animate-pulse" : "text-emerald-400"}`}>
+                    {currentDrawdownPercent > maxDrawdownPercent || emergencyKillSwitch ? "BLOCCO (CLOSE_ALL)" : "REGOLARE"}
+                  </span>
+                </div>
+              </div>
+            </div>
+            
+            {/* Modal Footer */}
+            <div className="p-3 border-t border-terminal-border bg-terminal-bg/50 flex justify-end gap-2">
+              <button
+                onClick={() => setShowRiskModal(false)}
+                className="px-3 py-1.5 text-[10px] uppercase font-bold text-slate-400 hover:text-white rounded transition"
+              >
+                Annulla
+              </button>
+              <button
+                onClick={saveRiskSettings}
+                className="bg-terminal-accent text-black px-4 py-1.5 text-[10px] uppercase font-black rounded hover:bg-white transition"
+              >
+                Salva Limiti
+              </button>
+            </div>
           </div>
         </div>
       )}

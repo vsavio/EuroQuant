@@ -275,35 +275,39 @@ void ProcessSingleSignal(string json_obj)
    // Count open positions for this magic number and symbol
    bool has_buy = false;
    bool has_sell = false;
-   
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber && PositionGetString(POSITION_SYMBOL) == symbol)
-      {
-         long pos_type = PositionGetInteger(POSITION_TYPE);
-         if(pos_type == POSITION_TYPE_BUY)
-         {
-            has_buy = true;
-            if(action == "SELL")
-            {
-               trade.PositionClose(ticket);
-               Print("[EuroQuant Multi-Bridge] Chiusa posizione BUY su ", symbol, " per segnale SELL.");
-               has_buy = false;
-            }
-         }
-         else if(pos_type == POSITION_TYPE_SELL)
-         {
-            has_sell = true;
-            if(action == "BUY")
-            {
-               trade.PositionClose(ticket);
-               Print("[EuroQuant Multi-Bridge] Chiusa posizione SELL su ", symbol, " per segnale BUY.");
-               has_sell = false;
-            }
-         }
-      }
-   }
+       for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+       ulong ticket = PositionGetTicket(i);
+       if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber && PositionGetString(POSITION_SYMBOL) == symbol)
+       {
+          long pos_type = PositionGetInteger(POSITION_TYPE);
+          if(pos_type == POSITION_TYPE_BUY)
+          {
+             has_buy = true;
+             if(action == "SELL" || action == "CLOSE_ALL")
+             {
+                trade.PositionClose(ticket);
+                Print("[EuroQuant Multi-Bridge] Chiusa posizione BUY su ", symbol, " per segnale ", action, ".");
+                has_buy = false;
+             }
+          }
+          else if(pos_type == POSITION_TYPE_SELL)
+          {
+             has_sell = true;
+             if(action == "BUY" || action == "CLOSE_ALL")
+             {
+                trade.PositionClose(ticket);
+                Print("[EuroQuant Multi-Bridge] Chiusa posizione SELL su ", symbol, " per segnale ", action, ".");
+                has_sell = false;
+             }
+          }
+       }
+    }
+    
+    if(action == "CLOSE_ALL" || action == "HOLD" || action == "NEUTRAL" || action == "NONE")
+    {
+       return;
+    }
    
    if(!InpEnableTrading)
    {

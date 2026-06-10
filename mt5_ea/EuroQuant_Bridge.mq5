@@ -340,27 +340,33 @@ void ManagePositions(string trade_symbol, string action, double sl, double tp, d
          if(pos_type == POSITION_TYPE_BUY)
          {
             has_buy = true;
-            // Close BUY position if signal is SELL
-            if(action == "SELL")
+            // Close BUY position if signal is SELL or CLOSE_ALL
+            if(action == "SELL" || action == "CLOSE_ALL")
             {
                trade.PositionClose(ticket);
-               Print("[EuroQuant Bridge] Chiusa posizione BUY precedente su ", trade_symbol, " su segnale SELL.");
+               Print("[EuroQuant Bridge] Chiusa posizione BUY precedente su ", trade_symbol, " su segnale ", action, ".");
                has_buy = false;
             }
          }
          else if(pos_type == POSITION_TYPE_SELL)
          {
             has_sell = true;
-            // Close SELL position if signal is BUY
-            if(action == "BUY")
+            // Close SELL position if signal is BUY or CLOSE_ALL
+            if(action == "BUY" || action == "CLOSE_ALL")
             {
                trade.PositionClose(ticket);
-               Print("[EuroQuant Bridge] Chiusa posizione SELL precedente su ", trade_symbol, " su segnale BUY.");
+               Print("[EuroQuant Bridge] Chiusa posizione SELL precedente su ", trade_symbol, " su segnale ", action, ".");
                has_sell = false;
             }
          }
       }
    }
+   
+   if(action == "CLOSE_ALL" || action == "HOLD" || action == "NEUTRAL" || action == "NONE")
+   {
+      return;
+   }
+
    
    // Calculate dynamic lot size based on broker limits and user multiplier
    double min_lot = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_MIN);
