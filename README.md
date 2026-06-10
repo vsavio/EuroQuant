@@ -120,3 +120,7 @@ To connect MetaTrader 5 to your local EuroQuant server:
 
 ## 🔒 License
 This repository is licensed under the MIT License. Feel free to modify and customize it for your personal trading systems.
+<<<<<<< HEAD
+=======
+
+>>>>>>> b1a553b8b249cf9bc73a8d326798162f7f768651
