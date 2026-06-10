@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: euroquant_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: euroquant_user
+      POSTGRES_PASSWORD: euroquant_password
+      POSTGRES_DB: euroquant_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U euroquant_user -d euroquant_db" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    container_name: euroquant_backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://euroquant_user:euroquant_password@db:5432/euroquant_db
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      db:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  worker:
+    build: ./worker
+    container_name: euroquant_worker
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://euroquant_user:euroquant_password@db:5432/euroquant_db
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - RUN_ONCE_AND_LOOP=true
+      - LOOP_INTERVAL_HOURS=1
+      - PYTHONUNBUFFERED=1
+      - DISABLE_FINBERT=true
+    depends_on:
+      db:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  frontend:
+    build: ./frontend
+    container_name: euroquant_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
