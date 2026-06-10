@@ -67,6 +67,17 @@ def main():
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             )
         """))
+        db.execute(text("ALTER TABLE stock_prices ADD COLUMN IF NOT EXISTS adx NUMERIC(8,4)"))
+        db.execute(text("ALTER TABLE stock_prices ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
+        
+        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS adx NUMERIC(8,4)"))
+        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
+        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS volatility_lot_sizing NUMERIC(8,4)"))
+        
+        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS adx NUMERIC(8,4)"))
+        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
+        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS volatility_lot_sizing NUMERIC(8,4)"))
+        
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS recommendation_history (
                 id SERIAL PRIMARY KEY,

@@ -87,6 +87,18 @@ interface StockDetail {
   take_profit: number;
 }
 
+interface BrokerAccount {
+  account_id: string;
+  broker: string;
+  balance: number;
+  equity: number;
+  margin: number;
+  margin_free: number;
+  margin_level: number;
+  profit: number;
+  last_seen: string | null;
+}
+
 export default function TerminalDashboard() {
   // States
   const [marketSummary, setMarketSummary] = useState<MarketSummary | null>(null);
@@ -116,6 +128,7 @@ export default function TerminalDashboard() {
   const [forexScreener, setForexScreener] = useState<ScreenerRow[]>([]);
   const [mt5Clients, setMt5Clients] = useState<any[]>([]);
   const [screenerTab, setScreenerTab] = useState<"stocks" | "forex">("stocks");
+  const [brokerAccounts, setBrokerAccounts] = useState<BrokerAccount[]>([]);
 
   useEffect(() => {
     const updateTime = () => {
@@ -176,6 +189,13 @@ export default function TerminalDashboard() {
         const data = await overridesRes.json();
         setActiveOverrides(data);
       }
+
+      // Fetch broker accounts
+      const accountsRes = await fetch(`${API_URL}/api/mt5/accounts`);
+      if (accountsRes.ok) {
+        const data = await accountsRes.json();
+        setBrokerAccounts(data);
+      }
     } catch (error) {
       console.error("Error fetching dashboard data:", error);
     }
@@ -199,10 +219,25 @@ export default function TerminalDashboard() {
         console.error("SSE parsing error:", err);
       }
     };
+
+    // WebSocket real-time client
+    const wsUrl = `${API_URL.replace("http://", "ws://").replace("https://", "wss://")}/ws/telemetry`;
+    const ws = new WebSocket(wsUrl);
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "telemetry_update" || msg.type === "overrides_update" || msg.type === "risk_update") {
+          fetchData();
+        }
+      } catch (err) {
+        console.error("WS parsing error:", err);
+      }
+    };
     
     return () => {
       clearInterval(interval);
       eventSource.close();
+      ws.close();
     };
   }, []);
 
@@ -750,9 +785,9 @@ export default function TerminalDashboard() {
         </div>
 
         {/* Right 1 column: News & MT5 Bridge */}
-        <div className="xl:col-span-1 flex flex-col gap-3 h-[650px]">
+        <div className="xl:col-span-1 flex flex-col gap-3">
           {/* A. News Feed */}
-          <div className="bg-terminal-card border border-terminal-border p-4 rounded flex flex-col flex-1 overflow-hidden">
+          <div className="bg-terminal-card border border-terminal-border p-4 rounded flex flex-col h-[360px] overflow-hidden">
             <h2 className="text-xs font-black uppercase text-slate-400 mb-3 border-b border-terminal-border pb-2 flex items-center gap-2">
               <Newspaper className="h-4 w-4 text-terminal-accent" /> Live News Feed (24H-48H)
             </h2>
@@ -811,35 +846,34 @@ export default function TerminalDashboard() {
           </div>
 
           {/* B. MT5 Bridge Diagnostics */}
-          <div className="bg-terminal-card border border-terminal-border p-4 rounded flex flex-col h-[220px] shrink-0 overflow-hidden">
-            <div className="flex items-center justify-between mb-2 border-b border-terminal-border pb-2">
-              <h2 className="text-xs font-black uppercase text-slate-400 flex items-center gap-2">
-                <Cpu className="h-4 w-4 text-terminal-accent" /> MT5 Bridge Diagnostics
+          <div className="bg-terminal-card border border-terminal-border p-3 rounded flex flex-col h-[150px] shrink-0 overflow-hidden">
+            <div className="flex items-center justify-between mb-1.5 border-b border-terminal-border pb-1.5">
+              <h2 className="text-[10px] font-black uppercase text-slate-400 flex items-center gap-1.5">
+                <Cpu className="h-3.5 w-3.5 text-terminal-accent" /> MT5 Bridge Diagnostics
               </h2>
-              <div className="flex items-center gap-1.5">
-                <span className={`h-2 w-2 rounded-full ${mt5Clients.length > 0 ? "bg-emerald-500 animate-pulse" : "bg-rose-500"}`}></span>
-                <span className="text-[10px] text-slate-400 font-bold uppercase">
+              <div className="flex items-center gap-1">
+                <span className={`h-1.5 w-1.5 rounded-full ${mt5Clients.length > 0 ? "bg-emerald-500 animate-pulse" : "bg-rose-500"}`}></span>
+                <span className="text-[9px] text-slate-400 font-bold uppercase">
                   {mt5Clients.length > 0 ? "Connected" : "Idle"}
                 </span>
               </div>
             </div>
 
-            <div className="overflow-y-auto flex-1 text-[11px] pr-1">
+            <div className="overflow-y-auto flex-1 text-[10px] pr-1">
               {mt5Clients.length === 0 ? (
                 <div className="h-full flex flex-col items-center justify-center text-center text-terminal-muted">
-                  <Activity className="h-6 w-6 text-terminal-muted/30 mb-1" />
+                  <Activity className="h-4 w-4 text-terminal-muted/30 mb-0.5" />
                   <span>Nessun client MT5 rilevato negli ultimi 5 min.</span>
-                  <span className="text-[9px] text-terminal-muted/65 mt-0.5">Avvia l'EA su MT5 per stabilire il collegamento.</span>
                 </div>
               ) : (
                 <div className="divide-y divide-terminal-border/20">
                   {mt5Clients.map((client, idx) => (
-                    <div key={idx} className="py-2 flex flex-col gap-0.5">
+                    <div key={idx} className="py-1 flex flex-col gap-0.5">
                       <div className="flex items-center justify-between">
-                        <span className="font-bold text-slate-350">IP: {client.ip}</span>
+                        <span className="font-bold text-slate-300">IP: {client.ip}</span>
                         <span className="text-terminal-accent font-semibold">{client.ticker}</span>
                       </div>
-                      <div className="flex items-center justify-between text-[10px] text-terminal-muted">
+                      <div className="flex items-center justify-between text-[9px] text-terminal-muted">
                         <span>Ultimo Ping:</span>
                         <span>
                           {(() => {
@@ -849,6 +883,80 @@ export default function TerminalDashboard() {
                             const seconds = String(d.getUTCSeconds()).padStart(2, '0');
                             return `${hours}:${minutes}:${seconds} Z`;
                           })()}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* C. MT5 Broker Accounts Telemetry */}
+          <div className="bg-terminal-card border border-terminal-border p-3 rounded flex flex-col h-[230px] shrink-0 overflow-hidden">
+            <div className="flex items-center justify-between mb-1.5 border-b border-terminal-border pb-1.5">
+              <h2 className="text-[10px] font-black uppercase text-slate-400 flex items-center gap-1.5">
+                <ShieldAlert className="h-3.5 w-3.5 text-terminal-accent" /> Broker Accounts Telemetry
+              </h2>
+              <span className="text-[8px] bg-slate-800 text-slate-400 font-mono px-1.5 py-0.2 rounded uppercase font-bold">
+                {brokerAccounts.length} Active
+              </span>
+            </div>
+
+            <div className="overflow-y-auto flex-1 text-[10px] pr-1">
+              {brokerAccounts.length === 0 ? (
+                <div className="h-full flex flex-col items-center justify-center text-center text-terminal-muted">
+                  <Activity className="h-4 w-4 text-terminal-muted/30 mb-0.5" />
+                  <span>Nessun account MT5 rilevato.</span>
+                </div>
+              ) : (
+                <div className="divide-y divide-terminal-border/20">
+                  {brokerAccounts.map((acct, idx) => (
+                    <div key={idx} className="py-1 flex flex-col gap-1">
+                      <div className="flex items-center justify-between text-[9px]">
+                        <span className="font-bold text-slate-200">Acc: {acct.account_id}</span>
+                        <span className="text-[8px] bg-terminal-accent/10 text-terminal-accent border border-terminal-accent/20 px-1 py-0.2 rounded font-mono font-bold">
+                          {acct.broker}
+                        </span>
+                      </div>
+                      
+                      <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 bg-terminal-bg/40 p-1.5 rounded border border-terminal-border/10 font-mono text-[9px]">
+                        <div className="flex justify-between">
+                          <span className="text-slate-500">Balance:</span>
+                          <span className="text-slate-350 font-bold">€{acct.balance.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-500">Equity:</span>
+                          <span className="text-slate-350 font-bold">€{acct.equity.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-500">Margin:</span>
+                          <span className="text-slate-350 font-bold">€{acct.margin.toFixed(2)}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-500">Profit:</span>
+                          <span className={`font-bold ${acct.profit >= 0 ? "text-emerald-400" : "text-rose-450"}`}>
+                            {acct.profit >= 0 ? "+" : ""}€{acct.profit.toFixed(2)}
+                          </span>
+                        </div>
+                        <div className="col-span-2 flex justify-between border-t border-terminal-border/10 pt-0.5 mt-0.5 text-[8px]">
+                          <span className="text-slate-500">Margin Level:</span>
+                          <span className={`font-bold ${acct.margin_level > 200 ? "text-emerald-400" : acct.margin_level > 100 ? "text-amber-450" : "text-rose-450 animate-pulse"}`}>
+                            {acct.margin_level.toFixed(1)}%
+                          </span>
+                        </div>
+                      </div>
+                      
+                      <div className="flex items-center justify-between text-[8px] text-terminal-muted">
+                        <span>Last Update:</span>
+                        <span>
+                          {acct.last_seen ? (() => {
+                            const d = new Date(acct.last_seen);
+                            const hours = String(d.getUTCHours()).padStart(2, '0');
+                            const minutes = String(d.getUTCMinutes()).padStart(2, '0');
+                            const seconds = String(d.getUTCSeconds()).padStart(2, '0');
+                            return `${hours}:${minutes}:${seconds} Z`;
+                          })() : "N/A"}
                         </span>
                       </div>
                     </div>

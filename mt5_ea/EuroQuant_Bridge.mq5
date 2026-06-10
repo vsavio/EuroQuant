@@ -21,7 +21,10 @@ input int      InpCheckIntervalSecs = 60;                                      /
 input group "=== RISK & POSITION MANAGEMENT ==="
 input double   InpLotMultiplier     = 1.0;                                     // Quota/Moltiplicatore rispetto al lotto minimo
 input ulong    InpMagicNumber       = 20260610;                                // Magic Number per identificare le posizioni
-input int      InpMaxSpreadPoints   = 50;                                      // Spread massimo consentito in punti
+input int      InpMaxSpreadPoints   = 50;                                      // Spread massimo consentito in punti (se InpMaxSpreadPercent <= 0)
+input double   InpMaxSpreadPercent  = 0.25;                                    // Spread massimo consentito in % del prezzo (0 per disabilitare)
+input int      InpMaxSlippagePoints = 30;                                      // Slippage massimo consentito in punti
+input int      InpOrderRetries      = 3;                                       // Numero di tentativi invio ordine
 input bool     InpEnableTrading     = true;                                    // Abilita esecuzione ordini a mercato
 input bool     InpSendAlerts        = true;                                    // Abilita gli alert grafici nel terminale
 
@@ -56,6 +59,7 @@ int OnInit()
 {
    // Set Magic Number for trade object
    trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpMaxSlippagePoints);
    
    // Initialize starting equity
    starting_equity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -185,7 +189,25 @@ void FetchAndExecuteSignal()
       }
    }
    
-   string request_url = InpApiUrl + "?ticker=" + ticker;
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double margin = AccountInfoDouble(ACCOUNT_MARGIN);
+   double margin_free = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double margin_level = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   double profit = AccountInfoDouble(ACCOUNT_PROFIT);
+   long login = AccountInfoInteger(ACCOUNT_LOGIN);
+   string company = AccountInfoString(ACCOUNT_COMPANY);
+   StringReplace(company, " ", "%20");
+   
+   string request_url = InpApiUrl + "?ticker=" + ticker +
+                        "&balance=" + DoubleToString(balance, 2) +
+                        "&equity=" + DoubleToString(equity, 2) +
+                        "&margin=" + DoubleToString(margin, 2) +
+                        "&margin_free=" + DoubleToString(margin_free, 2) +
+                        "&margin_level=" + DoubleToString(margin_level, 2) +
+                        "&profit=" + DoubleToString(profit, 2) +
+                        "&account=" + IntegerToString(login) +
+                        "&broker=" + company;
    
    char post[], result[];
    string result_headers;
@@ -218,10 +240,12 @@ void FetchAndExecuteSignal()
    string stop_loss_str = GetJsonValue(json_response, "stop_loss");
    string take_profit_str = GetJsonValue(json_response, "take_profit");
    string reason = GetJsonValue(json_response, "reason");
+   string vol_str = GetJsonValue(json_response, "volatility_lot_sizing");
    
    double entry_price = StringToDouble(entry_price_str);
    double stop_loss = StringToDouble(stop_loss_str);
    double take_profit = StringToDouble(take_profit_str);
+   double volatility_lot_sizing = (StringLen(vol_str) > 0) ? StringToDouble(vol_str) : 1.0;
    
    // Normalize Action
    StringToUpper(action);
@@ -253,7 +277,8 @@ void FetchAndExecuteSignal()
    Print("[EuroQuant Bridge] Segnale ricevuto per ", trade_symbol, ": ", action, 
          " | Price: ", DoubleToString(entry_price, digits),
          " | SL: ", DoubleToString(stop_loss, digits),
-         " | TP: ", DoubleToString(take_profit, digits));
+         " | TP: ", DoubleToString(take_profit, digits),
+         " | Vol Sizing: ", DoubleToString(volatility_lot_sizing, 2));
          
    if(action != last_signal)
    {
@@ -269,22 +294,38 @@ void FetchAndExecuteSignal()
       return;
    }
    
-   // Check Spread
-   int spread = (int)SymbolInfoInteger(trade_symbol, SYMBOL_SPREAD);
-   if(spread > InpMaxSpreadPoints)
-   {
-      Print("[EuroQuant Bridge] Spread su ", trade_symbol, " troppo alto (", spread, " punti). Operazione annullata.");
-      return;
-   }
+    // Check Spread
+    int spread = (int)SymbolInfoInteger(trade_symbol, SYMBOL_SPREAD);
+    double ask_price = SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+    double point_val = SymbolInfoDouble(trade_symbol, SYMBOL_POINT);
+    double spread_val = spread * point_val;
+    double spread_pct = (ask_price > 0) ? (spread_val / ask_price) * 100.0 : 0.0;
+    
+    if(InpMaxSpreadPercent > 0)
+    {
+       if(spread_pct > InpMaxSpreadPercent)
+       {
+          Print("[EuroQuant Bridge] Spread su ", trade_symbol, " troppo alto (", DoubleToString(spread_pct, 3), "% > limit ", DoubleToString(InpMaxSpreadPercent, 3), "%). Operazione annullata.");
+          return;
+       }
+    }
+    else
+    {
+       if(spread > InpMaxSpreadPoints)
+       {
+          Print("[EuroQuant Bridge] Spread su ", trade_symbol, " troppo alto (", spread, " punti > limit ", InpMaxSpreadPoints, " punti). Operazione annullata.");
+          return;
+       }
+    }
    
    // Manage Positions
-   ManagePositions(trade_symbol, action, stop_loss, take_profit);
+   ManagePositions(trade_symbol, action, stop_loss, take_profit, volatility_lot_sizing);
 }
 
 //+------------------------------------------------------------------+
 //| Manage existing positions and enter new trades based on signal   |
 //+------------------------------------------------------------------+
-void ManagePositions(string trade_symbol, string action, double sl, double tp)
+void ManagePositions(string trade_symbol, string action, double sl, double tp, double volatility_lot_sizing)
 {
    bool has_buy = false;
    bool has_sell = false;
@@ -326,7 +367,7 @@ void ManagePositions(string trade_symbol, string action, double sl, double tp)
    double max_lot = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_MAX);
    double lot_step = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_STEP);
    
-   double trade_lot = min_lot * InpLotMultiplier;
+   double trade_lot = min_lot * InpLotMultiplier * volatility_lot_sizing;
    
    // Normalize to broker volume step
    if(lot_step > 0)
@@ -340,29 +381,85 @@ void ManagePositions(string trade_symbol, string action, double sl, double tp)
    
    double point = SymbolInfoDouble(trade_symbol, SYMBOL_POINT);
    
-   // Place Orders
-   if(action == "BUY" && !has_buy)
-   {
-      double ask = SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
-      
-      // Safety SL/TP bounds checks
-      if(sl >= ask) sl = ask - 100 * point;
-      if(tp <= ask && tp > 0) tp = ask + 200 * point;
-      
-      trade.Buy(trade_lot, trade_symbol, ask, sl, tp, "EuroQuant Buy Signal");
-      Print("[EuroQuant Bridge] Inviato ordine BUY a mercato su ", trade_symbol, ". Volume calcolato: ", DoubleToString(trade_lot, 2), " (Lotto Minimo: ", DoubleToString(min_lot, 2), ")");
-   }
-   else if(action == "SELL" && !has_sell)
-   {
-      double bid = SymbolInfoDouble(trade_symbol, SYMBOL_BID);
-      
-      // Safety SL/TP bounds checks
-      if(sl <= bid && sl > 0) sl = bid + 100 * point;
-      if(tp >= bid) tp = bid - 200 * point;
-      
-      trade.Sell(trade_lot, trade_symbol, bid, sl, tp, "EuroQuant Sell Signal");
-      Print("[EuroQuant Bridge] Inviato ordine SELL a mercato su ", trade_symbol, ". Volume calcolato: ", DoubleToString(trade_lot, 2), " (Lotto Minimo: ", DoubleToString(min_lot, 2), ")");
-   }
+    // Place Orders
+    if(action == "BUY" && !has_buy)
+    {
+       double ask = SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+       
+       // Safety SL/TP bounds checks
+       if(sl >= ask) sl = ask - 100 * point;
+       if(tp <= ask && tp > 0) tp = ask + 200 * point;
+       
+       bool order_placed = false;
+       for(int retry = 0; retry < InpOrderRetries; retry++)
+       {
+          ResetLastError();
+          if(trade.Buy(trade_lot, trade_symbol, ask, sl, tp, "EuroQuant Buy Signal"))
+          {
+             uint retcode = trade.ResultRetcode();
+             if(retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_PLACED)
+             {
+                order_placed = true;
+                break;
+             }
+             Print("[EuroQuant Bridge] Tentativo BUY fallito. Retcode: ", retcode, ". Riprovo...");
+          }
+          else
+          {
+             Print("[EuroQuant Bridge] Chiamata Buy fallita. Errore: ", GetLastError(), ". Riprovo...");
+          }
+          Sleep(500);
+          ask = SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+       }
+       
+       if(order_placed)
+       {
+          Print("[EuroQuant Bridge] Inviato ordine BUY a mercato su ", trade_symbol, ". Volume calcolato: ", DoubleToString(trade_lot, 2), " (Lotto Minimo: ", DoubleToString(min_lot, 2), ")");
+       }
+       else
+       {
+          Print("[EuroQuant Bridge] Impossibile inserire ordine BUY su ", trade_symbol, " dopo ", InpOrderRetries, " tentativi.");
+       }
+    }
+    else if(action == "SELL" && !has_sell)
+    {
+       double bid = SymbolInfoDouble(trade_symbol, SYMBOL_BID);
+       
+       // Safety SL/TP bounds checks
+       if(sl <= bid && sl > 0) sl = bid + 100 * point;
+       if(tp >= bid) tp = bid - 200 * point;
+       
+       bool order_placed = false;
+       for(int retry = 0; retry < InpOrderRetries; retry++)
+       {
+          ResetLastError();
+          if(trade.Sell(trade_lot, trade_symbol, bid, sl, tp, "EuroQuant Sell Signal"))
+          {
+             uint retcode = trade.ResultRetcode();
+             if(retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_PLACED)
+             {
+                order_placed = true;
+                break;
+             }
+             Print("[EuroQuant Bridge] Tentativo SELL fallito. Retcode: ", retcode, ". Riprovo...");
+          }
+          else
+          {
+             Print("[EuroQuant Bridge] Chiamata Sell fallita. Errore: ", GetLastError(), ". Riprovo...");
+          }
+          Sleep(500);
+          bid = SymbolInfoDouble(trade_symbol, SYMBOL_BID);
+       }
+       
+       if(order_placed)
+       {
+          Print("[EuroQuant Bridge] Inviato ordine SELL a mercato su ", trade_symbol, ". Volume calcolato: ", DoubleToString(trade_lot, 2), " (Lotto Minimo: ", DoubleToString(min_lot, 2), ")");
+       }
+       else
+       {
+          Print("[EuroQuant Bridge] Impossibile inserire ordine SELL su ", trade_symbol, " dopo ", InpOrderRetries, " tentativi.");
+       }
+    }
 }
 
 //+------------------------------------------------------------------+

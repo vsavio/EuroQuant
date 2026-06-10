@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
@@ -6,8 +6,43 @@ from datetime import datetime, timezone
 import yfinance as yf
 from sqlalchemy import create_engine, text
 import os
+import asyncio
 
 app = FastAPI(title="EuroQuant institutional API", version="1.0.0")
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_json(message)
+            except Exception:
+                self.disconnect(connection)
+
+manager = ConnectionManager()
+
+@app.websocket("/ws/telemetry")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection open
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
+
 
 # Enable CORS for Next.js frontend
 app.add_middleware(
@@ -20,6 +55,30 @@ app.add_middleware(
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://euroquant_user:euroquant_password@db:5432/euroquant_db")
 engine = create_engine(DATABASE_URL)
+
+# Initialize table(s) if not exists
+try:
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS broker_accounts (
+                account_id VARCHAR(50) PRIMARY KEY,
+                broker VARCHAR(100),
+                balance NUMERIC(15, 2),
+                equity NUMERIC(15, 2),
+                margin NUMERIC(15, 2),
+                margin_free NUMERIC(15, 2),
+                margin_level NUMERIC(15, 2),
+                profit NUMERIC(15, 2),
+                last_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS parent_article_id INTEGER;
+        """))
+        conn.commit()
+
+except Exception as e:
+    print(f"Error creating broker_accounts table: {e}")
 
 # Global tracker for MT5 clients and manual overrides
 mt5_clients = {}
@@ -479,6 +538,7 @@ def get_news():
     query = text("""
         SELECT a.id, a.title, '' as content, a.url, a.source, a.published_date, a.country, a.sentiment_label, a.sentiment_score
         FROM news_articles a
+        WHERE a.parent_article_id IS NULL
         ORDER BY a.published_date DESC
         LIMIT 50
     """)
@@ -742,9 +802,23 @@ class MT5Signal(BaseModel):
     take_profit: float
     reason: str
     timestamp: str
+    adx: Optional[float] = None
+    atr: Optional[float] = None
+    volatility_lot_sizing: Optional[float] = 1.0
 
 @app.get("/api/mt5/signals")
-def get_mt5_signals(request: Request, ticker: Optional[str] = None):
+async def get_mt5_signals(
+    request: Request, 
+    ticker: Optional[str] = None,
+    balance: Optional[float] = None,
+    equity: Optional[float] = None,
+    margin: Optional[float] = None,
+    margin_free: Optional[float] = None,
+    margin_level: Optional[float] = None,
+    profit: Optional[float] = None,
+    account: Optional[str] = None,
+    broker: Optional[str] = None
+):
     # Log ping
     client_ip = request.headers.get("x-forwarded-for")
     if not client_ip:
@@ -757,12 +831,44 @@ def get_mt5_signals(request: Request, ticker: Optional[str] = None):
         "last_seen": datetime.now(timezone.utc).isoformat(),
         "ticker": ticker or "ALL (Multi-Symbol)"
     }
+    
+    if account:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    INSERT INTO broker_accounts (account_id, broker, balance, equity, margin, margin_free, margin_level, profit, last_seen)
+                    VALUES (:account_id, :broker, :balance, :equity, :margin, :margin_free, :margin_level, :profit, NOW())
+                    ON CONFLICT (account_id) DO UPDATE SET
+                        broker = EXCLUDED.broker,
+                        balance = EXCLUDED.balance,
+                        equity = EXCLUDED.equity,
+                        margin = EXCLUDED.margin,
+                        margin_free = EXCLUDED.margin_free,
+                        margin_level = EXCLUDED.margin_level,
+                        profit = EXCLUDED.profit,
+                        last_seen = NOW()
+                """), {
+                    "account_id": account,
+                    "broker": broker,
+                    "balance": balance,
+                    "equity": equity,
+                    "margin": margin,
+                    "margin_free": margin_free,
+                    "margin_level": margin_level,
+                    "profit": profit
+                })
+                conn.commit()
+            await manager.broadcast({"type": "telemetry_update"})
+        except Exception as e:
+            print(f"Error syncing broker account telemetry: {e}")
+
+            
     with engine.connect() as conn:
         # Fetch active symbols, matching either the exact ticker (e.g., EURUSD=X) or the cleaned MT5 symbol (e.g., EURUSD)
         if ticker:
             rows = conn.execute(
                 text("""
-                    SELECT r.ticker, r.signal, r.reason_technical, p.close, r.timestamp
+                    SELECT r.ticker, r.signal, r.reason_technical, p.close, r.timestamp, r.adx, r.atr, r.volatility_lot_sizing
                     FROM recommendations r
                     JOIN (
                         SELECT ticker, close, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY timestamp DESC) as rn
@@ -778,7 +884,7 @@ def get_mt5_signals(request: Request, ticker: Optional[str] = None):
         else:
             rows = conn.execute(
                 text("""
-                    SELECT r.ticker, r.signal, r.reason_technical, p.close, r.timestamp
+                    SELECT r.ticker, r.signal, r.reason_technical, p.close, r.timestamp, r.adx, r.atr, r.volatility_lot_sizing
                     FROM recommendations r
                     JOIN (
                         SELECT ticker, close, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY timestamp DESC) as rn
@@ -789,7 +895,7 @@ def get_mt5_signals(request: Request, ticker: Optional[str] = None):
             ).fetchall()
 
         signals = []
-        for r_ticker, r_signal, r_reason, r_price, r_gen in rows:
+        for r_ticker, r_signal, r_reason, r_price, r_gen, r_adx, r_atr, r_vol in rows:
             # Check for manual overrides
             active_signal = r_signal
             active_reason = r_reason
@@ -860,7 +966,10 @@ def get_mt5_signals(request: Request, ticker: Optional[str] = None):
                 stop_loss=sl,
                 take_profit=tp,
                 reason=active_reason or "Nessun dettaglio aggiuntivo.",
-                timestamp=r_gen.strftime("%Y-%m-%d %H:%M:%S") + " Z" if r_gen else ""
+                timestamp=r_gen.strftime("%Y-%m-%d %H:%M:%S") + " Z" if r_gen else "",
+                adx=float(r_adx) if r_adx is not None else None,
+                atr=float(r_atr) if r_atr is not None else None,
+                volatility_lot_sizing=float(r_vol) if r_vol is not None else 1.0
             ))
             
         if ticker:
@@ -922,8 +1031,34 @@ def get_forex_screener():
 def get_overrides():
     return manual_overrides
 
+@app.get("/api/mt5/accounts")
+def get_broker_accounts():
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT account_id, broker, balance, equity, margin, margin_free, margin_level, profit, last_seen 
+                FROM broker_accounts 
+                ORDER BY last_seen DESC
+            """)).fetchall()
+            return [
+                {
+                    "account_id": r[0],
+                    "broker": r[1],
+                    "balance": float(r[2]) if r[2] is not None else 0.0,
+                    "equity": float(r[3]) if r[3] is not None else 0.0,
+                    "margin": float(r[4]) if r[4] is not None else 0.0,
+                    "margin_free": float(r[5]) if r[5] is not None else 0.0,
+                    "margin_level": float(r[6]) if r[6] is not None else 0.0,
+                    "profit": float(r[7]) if r[7] is not None else 0.0,
+                    "last_seen": r[8].isoformat() if r[8] else None
+                } for r in rows
+            ]
+    except Exception as e:
+        print(f"Error fetching broker accounts: {e}")
+        return []
+
 @app.post("/api/mt5/overrides")
-def set_override(payload: OverridePayload):
+async def set_override(payload: OverridePayload):
     ticker = payload.ticker
     action = payload.action
     if action == "CLEAR":
@@ -933,7 +1068,9 @@ def set_override(payload: OverridePayload):
             "action": action,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
+    await manager.broadcast({"type": "overrides_update"})
     return {"status": "success", "overrides": manual_overrides}
+
 
 @app.get("/api/recommendations/history", response_model=List[SignalHistoryItem])
 def get_recommendations_history(ticker: str):

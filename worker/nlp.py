@@ -221,9 +221,74 @@ def calculate_decayed_sentiment(ticker, db):
         
     return weighted_sentiment_sum / total_weight
 
+_tokenizer = None
+_model = None
+
+def get_embeddings(texts):
+    global _tokenizer, _model
+    if _tokenizer is None or _model is None:
+        model_name = "sentence-transformers/all-MiniLM-L6-v2"
+        print(f"Loading local embedding model: {model_name}...")
+        import torch
+        from transformers import AutoTokenizer, AutoModel
+        torch.set_num_threads(1) # CPU-safe thread count
+        _tokenizer = AutoTokenizer.from_pretrained(model_name)
+        _model = AutoModel.from_pretrained(model_name)
+    
+    import torch
+    
+    def mean_pooling(model_output, attention_mask):
+        token_embeddings = model_output[0]
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+    encoded_input = _tokenizer(texts, padding=True, truncation=True, max_length=128, return_tensors='pt')
+    with torch.no_grad():
+        model_output = _model(**encoded_input)
+
+    sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
+    sentence_embeddings = torch.nn.functional.normalize(sentence_embeddings, p=2, dim=1)
+    return sentence_embeddings.numpy()
+
+def cluster_articles(articles):
+    if not articles or len(articles) < 2:
+        return []
+    
+    import numpy as np
+    texts = [art[1] for art in articles] # Get titles
+    try:
+        embeddings = get_embeddings(texts)
+    except Exception as e:
+        print(f"Error computing local embeddings for news clustering: {e}")
+        return []
+        
+    n = len(articles)
+    visited = [False] * n
+    clusters = []
+    
+    for i in range(n):
+        if visited[i]:
+            continue
+        visited[i] = True
+        cluster = [i]
+        
+        for j in range(i + 1, n):
+            if visited[j]:
+                continue
+            sim = np.dot(embeddings[i], embeddings[j])
+            if sim > 0.78:
+                visited[j] = True
+                cluster.append(j)
+                
+        if len(cluster) > 1:
+            clusters.append(cluster)
+            
+    return clusters
+
 def process_unprocessed_news():
     """
-    Retrieves unprocessed articles, runs NER ticker mapping, updates sentiment in database.
+    Retrieves unprocessed articles, clusters near-duplicates using a local model,
+    runs NER ticker mapping, and updates sentiment in the database.
     """
     db = SessionLocal()
     try:
@@ -245,11 +310,26 @@ def process_unprocessed_news():
             return 0
             
         print(f"NLP Pipeline: processing {len(articles)} articles...")
+        
+        # Cluster unprocessed articles using local model
+        clusters = cluster_articles(articles)
+        child_to_parent_index = {}
+        parent_indices = set()
+        for c in clusters:
+            parent_idx = c[0]
+            parent_indices.add(parent_idx)
+            for child_idx in c[1:]:
+                child_to_parent_index[child_idx] = parent_idx
+        
+        print(f"NLP Pipeline: found {len(clusters)} clusters of duplicate/similar stories.")
+        
         processed_count = 0
         ollama_calls_made = 0
         max_ollama_calls = 3 # Cap Ollama calls to keep execution fast on virtual CPU
         
-        for art in articles:
+        processed_parents = {} # Maps parent_idx -> (parent_id, label, score, tickers)
+        
+        for idx, art in enumerate(articles):
             art_id, title, content, url, source, country = art
             
             # Print progress update
@@ -257,7 +337,38 @@ def process_unprocessed_news():
                 print(f"NLP: Processing article {processed_count + 1}/{len(articles)} ({source}) - {title[:45]}...")
             
             try:
-                # 1. Map to companies (NER)
+                # Check if this article is a child of a cluster
+                if idx in child_to_parent_index:
+                    parent_idx = child_to_parent_index[idx]
+                    if parent_idx in processed_parents:
+                        parent_id, label, score, tickers = processed_parents[parent_idx]
+                        
+                        # Save sentiment and link to parent
+                        db.execute(
+                            text("""
+                                UPDATE news_articles 
+                                SET sentiment_score = :score, sentiment_label = :label, processed = TRUE, parent_article_id = :parent_id
+                                WHERE id = :id
+                            """),
+                            {"score": score, "label": label, "parent_id": parent_id, "id": art_id}
+                        )
+                        
+                        # Copy mappings
+                        for ticker in tickers:
+                            db.execute(
+                                text("""
+                                    INSERT INTO news_company_mappings (article_id, company_ticker)
+                                    VALUES (:article_id, :ticker)
+                                    ON CONFLICT DO NOTHING
+                                """),
+                                {"article_id": art_id, "ticker": ticker}
+                            )
+                        db.commit()
+                        processed_count += 1
+                        print(f"NLP: Clustered child duplicate '{title[:35]}...' under parent ID {parent_id}.")
+                        continue
+                
+                # 1. Map to companies (NER) for parent or independent article
                 tickers = map_article_to_tickers(title, content)
                 
                 # 2. Run Sentiment Analysis only if it maps to a target company
@@ -282,7 +393,6 @@ def process_unprocessed_news():
                 
                 # 4. Insert company mappings
                 for ticker in tickers:
-                    # Ignore duplicate mappings
                     db.execute(
                         text("""
                             INSERT INTO news_company_mappings (article_id, company_ticker)
@@ -292,6 +402,11 @@ def process_unprocessed_news():
                         {"article_id": art_id, "ticker": ticker}
                     )
                 db.commit()
+                
+                # If this was a parent, store results to copy for children
+                if idx in parent_indices:
+                    processed_parents[idx] = (art_id, label, score, tickers)
+                    
                 processed_count += 1
             except Exception as e:
                 print(f"Error processing NLP for article ID {art_id}: {e}")
@@ -301,6 +416,7 @@ def process_unprocessed_news():
         return processed_count
     finally:
         db.close()
+
 
 if __name__ == "__main__":
     process_unprocessed_news()

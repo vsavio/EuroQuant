@@ -9,7 +9,7 @@ from nlp import calculate_decayed_sentiment
 def get_latest_price_metrics(ticker, db):
     """Retrieves the latest two stock price records for a ticker to calculate metrics."""
     query = text("""
-        SELECT close, open, high, low, volume, rsi, macd, macd_signal, sma_20, sma_50, sma_200, timestamp
+        SELECT close, open, high, low, volume, rsi, macd, macd_signal, sma_20, sma_50, sma_200, timestamp, adx, atr
         FROM stock_prices
         WHERE ticker = :ticker
         ORDER BY timestamp DESC
@@ -27,6 +27,24 @@ def get_latest_price_metrics(ticker, db):
     if prev and prev[0] and latest[0]:
         price_change_pct = float((latest[0] - prev[0]) / prev[0]) * 100.0
         
+    # Calculate baseline ATR for volatility lot sizing
+    baseline_query = text("""
+        SELECT AVG(atr) FROM (
+            SELECT atr FROM stock_prices 
+            WHERE ticker = :ticker AND atr IS NOT NULL
+            ORDER BY timestamp DESC 
+            LIMIT 100
+        ) sub
+    """)
+    baseline_atr = db.execute(baseline_query, {"ticker": ticker}).scalar()
+    
+    current_atr = float(latest[13]) if (len(latest) > 13 and latest[13] is not None) else None
+    if baseline_atr and current_atr and current_atr > 0:
+        import numpy as np
+        volatility_lot_sizing = float(np.clip(float(baseline_atr) / current_atr, 0.25, 2.0))
+    else:
+        volatility_lot_sizing = 1.0
+        
     return {
         "close": float(latest[0]) if latest[0] else None,
         "open": float(latest[1]) if latest[1] else None,
@@ -39,8 +57,11 @@ def get_latest_price_metrics(ticker, db):
         "sma_20": float(latest[8]) if latest[8] else None,
         "sma_50": float(latest[9]) if latest[9] else None,
         "sma_200": float(latest[10]) if latest[10] else None,
-        "price_change_24h": price_change_pct,
-        "timestamp": latest[11]
+        "timestamp": latest[11],
+        "adx": float(latest[12]) if (len(latest) > 12 and latest[12] is not None) else None,
+        "atr": current_atr,
+        "volatility_lot_sizing": volatility_lot_sizing,
+        "price_change_24h": price_change_pct
     }
 
 def get_latest_v2tx_from_db(db):
@@ -75,30 +96,87 @@ def get_top_news_for_company(ticker, db, limit=3):
         } for r in rows
     ]
 
+def query_gemini_recommendation(ticker, company_name, metrics, sentiment, news, v2tx, prompt):
+    """
+    Queries Google Gemini API as a high-reliability fallback if local Ollama fails.
+    """
+    import os
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return None
+        
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "generationConfig": {
+                "responseMimeType": "application/json"
+            }
+        }
+        response = requests.post(url, json=payload, timeout=20)
+        if response.status_code == 200:
+            res_data = response.json()
+            raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            data = json.loads(raw_text)
+            
+            rating = data.get("rating", "HOLD").upper()
+            if rating not in ["STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL"]:
+                rating = "HOLD"
+                
+            return {
+                "rating": rating,
+                "reason_macro": data.get("reason_macro", ""),
+                "reason_micro": data.get("reason_micro", ""),
+                "reason_technical": data.get("reason_technical", "")
+            }
+    except Exception as e:
+        print(f"Gemini API fallback failed for {ticker}: {e}")
+    return None
+
 def query_ollama_recommendation(ticker, company_name, metrics, sentiment, news, v2tx):
     """
     Constructs prompt and queries Ollama for financial rating and reasons.
+    If Ollama fails, routes request to the Gemini API adapter.
     """
     news_str = "\n".join([f"- [{n['source']}] {n['title']} (Sentiment: {n['sentiment']} / Score: {n['score']})" for n in news])
     
     rsi_state = "Neutral"
-    if metrics["rsi"]:
+    if metrics.get("rsi"):
         if metrics["rsi"] > 70:
             rsi_state = "Overbought (Ipercomprato)"
         elif metrics["rsi"] < 30:
             rsi_state = "Oversold (Ipervenduto)"
             
+    adx_val = metrics.get("adx")
+    adx_str = f"{adx_val:.2f}" if adx_val is not None else "N/A"
+    adx_desc = "(Trend Forte)" if (adx_val is not None and adx_val > 25) else "(Trend Debole / Range)"
+    
+    rsi_val = metrics.get("rsi")
+    rsi_str = f"{rsi_val:.2f}" if rsi_val is not None else "N/A"
+    
+    macd_val = metrics.get("macd")
+    macd_str = f"{macd_val:.4f}" if macd_val is not None else "N/A"
+    
+    macd_signal_val = metrics.get("macd_signal")
+    macd_signal_str = f"{macd_signal_val:.4f}" if macd_signal_val is not None else "N/A"
+    
+    price_change = metrics.get("price_change_24h")
+    price_change_str = f"{price_change:.2f}" if price_change is not None else "N/A"
+    
     prompt = f"""You are a senior institutional quantitative & financial analyst.
 Analyze the following asset data and news:
-
+ 
 Asset: {company_name} ({ticker})
-- Current Price: € {metrics['close']} (24h Change: {metrics['price_change_24h']:.2f}%)
+- Current Price: € {metrics.get('close')} (24h Change: {price_change_str}%)
 - Technical Indicators:
-  * RSI (14): {metrics['rsi']:.2f} (State: {rsi_state})
-  * MACD: {metrics['macd']:.4f} (Signal Line: {metrics['macd_signal']:.4f})
-  * SMA 20: € {metrics['sma_20']}
-  * SMA 50: € {metrics['sma_50']}
-  * SMA 200: € {metrics['sma_200']}
+  * RSI (14): {rsi_str} (State: {rsi_state})
+  * ADX (14) Trend Strength: {adx_str} {adx_desc}
+  * MACD: {macd_str} (Signal Line: {macd_signal_str})
+  * SMA 20: € {metrics.get('sma_20')}
+  * SMA 50: € {metrics.get('sma_50')}
+  * SMA 200: € {metrics.get('sma_200')}
 - Aggregated Sentiment (24h-48h Decayed): {sentiment:.4f}
 - VSTOXX Volatility Index (V2TX): {v2tx:.2f}
 - Recent News Context:
@@ -112,12 +190,13 @@ You MUST respond ONLY with a valid JSON object in Italian matching this schema:
   "rating": "STRONG BUY" | "BUY" | "HOLD" | "SELL" | "STRONG SELL",
   "reason_macro": "Un paragrafo professionale in italiano che descrive il contesto macroeconomico e l'indice di riferimento.",
   "reason_micro": "Un paragrafo professionale in italiano che descrive i dati aziendali, il sentiment delle notizie e l'andamento specifico.",
-  "reason_technical": "Un paragrafo professionale in italiano che descrive i trend tecnici, livelli di RSI, MACD e medie mobili."
+  "reason_technical": "Un paragrafo professionale in italiano che descrive i trend tecnici, livelli di RSI, ADX, MACD e medie mobili."
 }}
 
 Do not write any text outside of the JSON block. Do not include markdown code ticks.
 """
 
+    # 1. Try Ollama (Local)
     try:
         url = f"{OLLAMA_HOST}/api/generate"
         payload = {
@@ -131,13 +210,12 @@ Do not write any text outside of the JSON block. Do not include markdown code ti
             }
         }
         
-        response = requests.post(url, json=payload, timeout=90)
+        response = requests.post(url, json=payload, timeout=30)
         if response.status_code == 200:
             res_data = response.json()
             raw_text = res_data.get("response", "").strip()
             data = json.loads(raw_text)
             
-            # Normalize keys and values
             rating = data.get("rating", "HOLD").upper()
             if rating not in ["STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL"]:
                 rating = "HOLD"
@@ -149,9 +227,16 @@ Do not write any text outside of the JSON block. Do not include markdown code ti
                 "reason_technical": data.get("reason_technical", "")
             }
     except Exception as e:
-        print(f"Ollama recommendation failed for {ticker}: {e}")
+        print(f"Ollama recommendation failed for {ticker}: {e}. Trying Gemini API fallback...")
         
-    # Standard rule-based fallback inside the query function as backup
+    # 2. Fallback to Gemini API
+    gemini_res = query_gemini_recommendation(ticker, company_name, metrics, sentiment, news, v2tx, prompt)
+    if gemini_res:
+        print(f"Gemini API fallback successful for {ticker}.")
+        return gemini_res
+        
+    # 3. Final Rule-based Fallback
+    print(f"All LLM backends failed for {ticker}. Running rule-based logic.")
     return generate_rule_based_fallback(ticker, company_name, metrics, sentiment, news, v2tx)
 
 def generate_rule_based_fallback(ticker, company_name, metrics, sentiment, news, v2tx):
@@ -242,8 +327,8 @@ def generate_recommendations():
                 # Save to database
                 db.execute(
                     text("""
-                        INSERT INTO recommendations (ticker, timestamp, signal, sentiment_score, price_change_24h, reason_macro, reason_micro, reason_technical, full_reason)
-                        VALUES (:ticker, :timestamp, :signal, :sentiment_score, :price_change_24h, :reason_macro, :reason_micro, :reason_technical, :full_reason)
+                        INSERT INTO recommendations (ticker, timestamp, signal, sentiment_score, price_change_24h, reason_macro, reason_micro, reason_technical, full_reason, adx, atr, volatility_lot_sizing)
+                        VALUES (:ticker, :timestamp, :signal, :sentiment_score, :price_change_24h, :reason_macro, :reason_micro, :reason_technical, :full_reason, :adx, :atr, :volatility_lot_sizing)
                         ON CONFLICT (ticker) DO UPDATE SET
                             timestamp = EXCLUDED.timestamp,
                             signal = EXCLUDED.signal,
@@ -252,7 +337,10 @@ def generate_recommendations():
                             reason_macro = EXCLUDED.reason_macro,
                             reason_micro = EXCLUDED.reason_micro,
                             reason_technical = EXCLUDED.reason_technical,
-                            full_reason = EXCLUDED.full_reason
+                            full_reason = EXCLUDED.full_reason,
+                            adx = EXCLUDED.adx,
+                            atr = EXCLUDED.atr,
+                            volatility_lot_sizing = EXCLUDED.volatility_lot_sizing
                     """),
                     {
                         "ticker": ticker,
@@ -263,13 +351,16 @@ def generate_recommendations():
                         "reason_macro": macro_reason,
                         "reason_micro": rec_data["reason_micro"],
                         "reason_technical": rec_data["reason_technical"],
-                        "full_reason": full_reason
+                        "full_reason": full_reason,
+                        "adx": metrics["adx"],
+                        "atr": metrics["atr"],
+                        "volatility_lot_sizing": metrics["volatility_lot_sizing"]
                     }
                 )
                 db.execute(
                     text("""
-                        INSERT INTO recommendation_history (ticker, timestamp, signal, sentiment_score, price_change_24h, reason_technical)
-                        VALUES (:ticker, :timestamp, :signal, :sentiment_score, :price_change_24h, :reason_technical)
+                        INSERT INTO recommendation_history (ticker, timestamp, signal, sentiment_score, price_change_24h, reason_technical, adx, atr, volatility_lot_sizing)
+                        VALUES (:ticker, :timestamp, :signal, :sentiment_score, :price_change_24h, :reason_technical, :adx, :atr, :volatility_lot_sizing)
                     """),
                     {
                         "ticker": ticker,
@@ -277,7 +368,10 @@ def generate_recommendations():
                         "signal": final_rating,
                         "sentiment_score": sentiment_score,
                         "price_change_24h": metrics["price_change_24h"],
-                        "reason_technical": rec_data["reason_technical"]
+                        "reason_technical": rec_data["reason_technical"],
+                        "adx": metrics["adx"],
+                        "atr": metrics["atr"],
+                        "volatility_lot_sizing": metrics["volatility_lot_sizing"]
                     }
                 )
                 db.commit()

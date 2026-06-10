@@ -20,7 +20,10 @@ input int      InpCheckIntervalSecs = 120;                                     /
 input group "=== RISK & POSITION MANAGEMENT ==="
 input double   InpLotMultiplier     = 1.0;                                     // Quota/Moltiplicatore rispetto al lotto minimo di ciascun simbolo
 input ulong    InpMagicNumber       = 20260620;                                // Magic Number per identificare le posizioni
-input int      InpMaxSpreadPoints   = 50;                                      // Spread massimo consentito in punti
+input int      InpMaxSpreadPoints   = 50;                                      // Spread massimo consentito in punti (se InpMaxSpreadPercent <= 0)
+input double   InpMaxSpreadPercent  = 0.25;                                    // Spread massimo consentito in % del prezzo (0 per disabilitare)
+input int      InpMaxSlippagePoints = 30;                                      // Slippage massimo consentito in punti
+input int      InpOrderRetries      = 3;                                       // Numero di tentativi invio ordine
 input bool     InpEnableTrading     = true;                                    // Abilita esecuzione ordini a mercato
 input bool     InpSendAlerts        = true;                                    // Abilita gli alert grafici nel terminale
 
@@ -57,6 +60,7 @@ int OnInit()
 {
    // Set Magic Number for trade object
    trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpMaxSlippagePoints);
    
    // Initialize starting equity
    starting_equity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -109,14 +113,33 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void FetchAndExecuteAllSignals()
 {
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double margin = AccountInfoDouble(ACCOUNT_MARGIN);
+   double margin_free = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double margin_level = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   double profit = AccountInfoDouble(ACCOUNT_PROFIT);
+   long login = AccountInfoInteger(ACCOUNT_LOGIN);
+   string company = AccountInfoString(ACCOUNT_COMPANY);
+   StringReplace(company, " ", "%20");
+   
+   string request_url = InpApiUrl + "?balance=" + DoubleToString(balance, 2) +
+                        "&equity=" + DoubleToString(equity, 2) +
+                        "&margin=" + DoubleToString(margin, 2) +
+                        "&margin_free=" + DoubleToString(margin_free, 2) +
+                        "&margin_level=" + DoubleToString(margin_level, 2) +
+                        "&profit=" + DoubleToString(profit, 2) +
+                        "&account=" + IntegerToString(login) +
+                        "&broker=" + company;
+   
    char post[], result[];
    string result_headers;
    int timeout = 10000; // 10 seconds for full list
    
    ResetLastError();
    
-   // Request the FULL list of signals (no ticker query parameter)
-   int res = WebRequest("GET", InpApiUrl, NULL, NULL, timeout, post, 0, result, result_headers);
+   // Request the FULL list of signals
+   int res = WebRequest("GET", request_url, NULL, NULL, timeout, post, 0, result, result_headers);
    
    if(res == -1)
    {
@@ -221,10 +244,12 @@ void ProcessSingleSignal(string json_obj)
    string stop_loss_str = GetJsonValue(json_obj, "stop_loss");
    string take_profit_str = GetJsonValue(json_obj, "take_profit");
    string reason = GetJsonValue(json_obj, "reason");
+   string vol_str = GetJsonValue(json_obj, "volatility_lot_sizing");
    
    double entry_price = StringToDouble(entry_price_str);
    double stop_loss = StringToDouble(stop_loss_str);
    double take_profit = StringToDouble(take_profit_str);
+   double volatility_lot_sizing = (StringLen(vol_str) > 0) ? StringToDouble(vol_str) : 1.0;
    
    StringToUpper(action);
    
@@ -297,10 +322,26 @@ void ProcessSingleSignal(string json_obj)
    
    // Check Spread
    int spread = (int)SymbolInfoInteger(symbol, SYMBOL_SPREAD);
-   if(spread > InpMaxSpreadPoints)
+   double ask_price = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double point_val = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double spread_val = spread * point_val;
+   double spread_pct = (ask_price > 0) ? (spread_val / ask_price) * 100.0 : 0.0;
+   
+   if(InpMaxSpreadPercent > 0)
    {
-      Print("[EuroQuant Multi-Bridge] Spread su ", symbol, " troppo alto (", spread, " punti). Ordine saltato.");
-      return;
+      if(spread_pct > InpMaxSpreadPercent)
+      {
+         Print("[EuroQuant Multi-Bridge] Spread su ", symbol, " troppo alto (", DoubleToString(spread_pct, 3), "% > limit ", DoubleToString(InpMaxSpreadPercent, 3), "%). Ordine saltato.");
+         return;
+      }
+   }
+   else
+   {
+      if(spread > InpMaxSpreadPoints)
+      {
+         Print("[EuroQuant Multi-Bridge] Spread su ", symbol, " troppo alto (", spread, " punti > limit ", InpMaxSpreadPoints, " punti). Ordine saltato.");
+         return;
+      }
    }
    
    // Calculate lot size dynamically for this specific symbol
@@ -313,7 +354,7 @@ void ProcessSingleSignal(string json_obj)
       return; // Skip if volume limits can't be fetched
    }
    
-   double trade_lot = min_lot * InpLotMultiplier;
+   double trade_lot = min_lot * InpLotMultiplier * volatility_lot_sizing;
    if(lot_step > 0)
    {
       trade_lot = MathRound(trade_lot / lot_step) * lot_step;

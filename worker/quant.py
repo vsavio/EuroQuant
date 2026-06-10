@@ -84,6 +84,32 @@ def fetch_and_calculate_all():
                 df["SMA_50"] = close_series.rolling(window=50).mean()
                 df["SMA_200"] = close_series.rolling(window=200).mean()
                 
+                # ATR (14)
+                high_s = df["High"]
+                low_s = df["Low"]
+                tr1 = high_s - low_s
+                tr2 = (high_s - close_series.shift()).abs()
+                tr3 = (low_s - close_series.shift()).abs()
+                tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+                df["ATR"] = tr.rolling(window=14).mean()
+                
+                # ADX (14)
+                up_move = high_s.diff()
+                down_move = -low_s.diff()
+                plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+                minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+                plus_dm = pd.Series(plus_dm, index=df.index)
+                minus_dm = pd.Series(minus_dm, index=df.index)
+                
+                tr_smooth = tr.rolling(window=14).sum()
+                plus_dm_smooth = plus_dm.rolling(window=14).sum()
+                minus_dm_smooth = minus_dm.rolling(window=14).sum()
+                
+                plus_di = 100 * (plus_dm_smooth / tr_smooth.replace(0, np.nan))
+                minus_di = 100 * (minus_dm_smooth / tr_smooth.replace(0, np.nan))
+                dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan).abs())
+                df["ADX"] = dx.rolling(window=14).mean()
+                
                 # Insert / Upsert last 250 rows into stock_prices to keep history fresh
                 df_to_save = df.tail(250)
                 
@@ -106,6 +132,8 @@ def fetch_and_calculate_all():
                     sma20 = float(row["SMA_20"]) if not pd.isna(row["SMA_20"]) else None
                     sma50 = float(row["SMA_50"]) if not pd.isna(row["SMA_50"]) else None
                     sma200 = float(row["SMA_200"]) if not pd.isna(row["SMA_200"]) else None
+                    atr_val = float(row["ATR"]) if not pd.isna(row["ATR"]) else None
+                    adx_val = float(row["ADX"]) if not pd.isna(row["ADX"]) else None
                     
                     # Store indices separately if they are not in the companies table
                     # We will only insert stock prices for tickers present in 'companies' table to respect references
@@ -116,8 +144,8 @@ def fetch_and_calculate_all():
                     if is_company:
                         db.execute(
                             text("""
-                                INSERT INTO stock_prices (ticker, timestamp, open, high, low, close, volume, rsi, macd, macd_signal, sma_20, sma_50, sma_200)
-                                VALUES (:ticker, :timestamp, :open, :high, :low, :close, :volume, :rsi, :macd, :macd_signal, :sma_20, :sma_50, :sma_200)
+                                INSERT INTO stock_prices (ticker, timestamp, open, high, low, close, volume, rsi, macd, macd_signal, sma_20, sma_50, sma_200, adx, atr)
+                                VALUES (:ticker, :timestamp, :open, :high, :low, :close, :volume, :rsi, :macd, :macd_signal, :sma_20, :sma_50, :sma_200, :adx, :atr)
                                 ON CONFLICT (ticker, timestamp) DO UPDATE SET
                                     open = EXCLUDED.open,
                                     high = EXCLUDED.high,
@@ -129,7 +157,9 @@ def fetch_and_calculate_all():
                                     macd_signal = EXCLUDED.macd_signal,
                                     sma_20 = EXCLUDED.sma_20,
                                     sma_50 = EXCLUDED.sma_50,
-                                    sma_200 = EXCLUDED.sma_200
+                                    sma_200 = EXCLUDED.sma_200,
+                                    adx = EXCLUDED.adx,
+                                    atr = EXCLUDED.atr
                             """),
                             {
                                 "ticker": ticker,
@@ -144,7 +174,9 @@ def fetch_and_calculate_all():
                                 "macd_signal": macd_sig_val,
                                 "sma_20": sma20,
                                 "sma_50": sma50,
-                                "sma_200": sma200
+                                "sma_200": sma200,
+                                "adx": adx_val,
+                                "atr": atr_val
                             }
                         )
                     else:
