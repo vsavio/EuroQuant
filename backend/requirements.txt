@@ -5,3 +5,12 @@ psycopg2-binary==2.9.9
 pydantic==2.7.4
 yfinance
 websockets
+scipy
+scikit-learn
+pandas
+numpy
+pyjwt==2.8.0
+cryptography==42.0.5
+slowapi==0.1.9
+tenacity==8.3.0
+cachetools==5.3.3

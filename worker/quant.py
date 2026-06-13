@@ -5,6 +5,8 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import text
 from database import SessionLocal
 from config import INDICES
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import requests.exceptions
 
 def calculate_rsi(series, period=14):
     """Computes standard Relative Strength Index (RSI)."""
@@ -27,6 +29,40 @@ def calculate_macd(series, fast=12, slow=26, signal=9):
     macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     return macd_line, signal_line
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((Exception,)),
+    reraise=True
+)
+def download_ticker_history_with_retry(ticker_clean, start, end):
+    """Download ticker history from yfinance with exponential backoff retry."""
+    from data_feeds import download_ticker_history
+    df = download_ticker_history(ticker_clean, start=start, end=end)
+    if df is None:
+        raise ValueError(f"Null dataframe returned for {ticker_clean}")
+    return df
+
+
+def _ensure_index_in_companies(ticker, name, db):
+    """Ensures index/V2TX ticker exists as a row in the companies table."""
+    existing = db.execute(
+        text("SELECT ticker FROM companies WHERE ticker = :ticker"),
+        {"ticker": ticker}
+    ).fetchone()
+    if not existing:
+        db.execute(
+            text("""
+                INSERT INTO companies (ticker, name, country, sector, industry)
+                VALUES (:ticker, :name, 'Europe', 'Index', 'Market Index')
+                ON CONFLICT (ticker) DO NOTHING
+            """),
+            {"ticker": ticker, "name": name}
+        )
+        db.commit()
+        print(f"Auto-seeded index {ticker} ({name}) into companies table.")
+
 
 def fetch_and_calculate_all():
     """
@@ -53,8 +89,11 @@ def fetch_and_calculate_all():
             try:
                 # Download historical daily data
                 ticker_clean = ticker
-                # yfinance handles tickers nicely
-                df = yf.download(ticker_clean, start=start_date.strftime("%Y-%m-%d"), end=end_date.strftime("%Y-%m-%d"), progress=False)
+                df = download_ticker_history_with_retry(
+                    ticker_clean,
+                    start=start_date.strftime("%Y-%m-%d"),
+                    end=end_date.strftime("%Y-%m-%d")
+                )
                 
                 if df.empty:
                     print(f"No price data retrieved for {ticker}")
@@ -180,16 +219,48 @@ def fetch_and_calculate_all():
                             }
                         )
                     else:
-                        # It is an index or V2TX. Let's save it to a temporary or global place or system logs?
-                        # Since we want to display index prices, let's create a table or just write them to a JSON configuration or cache?
-                        # Wait! It is much simpler to save indices to a key-value or cache, or simply fetch them live on API calls!
-                        # To keep it extremely simple and high performance, the FastAPI backend can fetch live index values from yfinance, or we can store them in a simple postgres table.
-                        # Wait! Saving them to the database is much faster for the dashboard because we don't block API requests with live yfinance downloads.
-                        # Let's check if there is an index table. If we want, we can add a table for index prices in `init.sql`, or we can insert index names in `companies` with a dummy sector/country so they fit in the same schema!
-                        # Wait, that is a brilliant hack! If we add `^STOXX`, `^GDAXI`, `^FCHI`, `FTSEMIB.MI`, `^IBEX`, `^V2TX` to the `companies` table under sector "Index" and country "Europe", we can store their prices in the `stock_prices` table without altering the schema!
-                        # Let's check if they are in the database. They aren't pre-seeded, but we can write code to automatically insert them into `companies` if they are not there, or seed them.
-                        # Let's seed them dynamically in `quant.py`!
-                        pass
+                        # Save index/V2TX to DB — ensure they exist in companies table first
+                        index_name = INDICES.get(ticker, ticker)
+                        if ticker == "^V2TX":
+                            index_name = "VSTOXX Volatility Index"
+                        _ensure_index_in_companies(ticker, index_name, db)
+                        db.execute(
+                            text("""
+                                INSERT INTO stock_prices (ticker, timestamp, open, high, low, close, volume, rsi, macd, macd_signal, sma_20, sma_50, sma_200, adx, atr)
+                                VALUES (:ticker, :timestamp, :open, :high, :low, :close, :volume, :rsi, :macd, :macd_signal, :sma_20, :sma_50, :sma_200, :adx, :atr)
+                                ON CONFLICT (ticker, timestamp) DO UPDATE SET
+                                    close = EXCLUDED.close,
+                                    open = EXCLUDED.open,
+                                    high = EXCLUDED.high,
+                                    low = EXCLUDED.low,
+                                    volume = EXCLUDED.volume,
+                                    rsi = EXCLUDED.rsi,
+                                    macd = EXCLUDED.macd,
+                                    macd_signal = EXCLUDED.macd_signal,
+                                    sma_20 = EXCLUDED.sma_20,
+                                    sma_50 = EXCLUDED.sma_50,
+                                    sma_200 = EXCLUDED.sma_200,
+                                    adx = EXCLUDED.adx,
+                                    atr = EXCLUDED.atr
+                            """),
+                            {
+                                "ticker": ticker,
+                                "timestamp": ts_aware,
+                                "open": open_val,
+                                "high": high_val,
+                                "low": low_val,
+                                "close": close_val,
+                                "volume": vol_val,
+                                "rsi": rsi_val,
+                                "macd": macd_val,
+                                "macd_signal": macd_sig_val,
+                                "sma_20": sma20,
+                                "sma_50": sma50,
+                                "sma_200": sma200,
+                                "adx": adx_val,
+                                "atr": atr_val
+                            }
+                        )
                 
                 db.commit()
                 updated_count += 1

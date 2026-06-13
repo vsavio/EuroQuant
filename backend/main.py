@@ -1,14 +1,68 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timezone
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import sys
+import json
+
+class StdoutJsonLogger:
+    def __init__(self, original_stream, level="INFO"):
+        self.original_stream = original_stream
+        self.level = level
+
+    def write(self, message):
+        stripped = message.strip()
+        if stripped:
+            log_data = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "level": self.level,
+                "message": stripped
+            }
+            self.original_stream.write(json.dumps(log_data) + "\n")
+            self.original_stream.flush()
+
+    def flush(self):
+        self.original_stream.flush()
+
+sys.stdout = StdoutJsonLogger(sys.stdout, "INFO")
+sys.stderr = StdoutJsonLogger(sys.stderr, "ERROR")
 import yfinance as yf
 from sqlalchemy import create_engine, text
 import os
 import asyncio
+from cachetools import TTLCache
+from auth import router as auth_router, get_current_user, require_admin, write_audit_log
 
+# Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="EuroQuant institutional API", version="1.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.include_router(auth_router)
+
+@app.get("/api/health", tags=["system"])
+def health_check():
+    """Lightweight health check for Docker and load balancers."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return JSONResponse({"status": "ok", "db": "connected"})
+    except Exception:
+        return JSONResponse({"status": "degraded", "db": "disconnected"}, status_code=503)
+
+# ─── In-Memory TTL Caches ───────────────────────────────────────────────────
+# Prevent repeated identical DB queries from concurrent clients.
+# TTL values are conservative — data freshness is more important than cache hits.
+_cache_market_summary = TTLCache(maxsize=1, ttl=30)     # 30s — market overview
+_cache_screener = TTLCache(maxsize=64, ttl=60)           # 60s — per-filter screener
+_cache_forex = TTLCache(maxsize=1, ttl=30)               # 30s — forex screener
+_cache_correlation = TTLCache(maxsize=8, ttl=300)        # 5min — correlation matrices
+_cache_risk_analytics = TTLCache(maxsize=1, ttl=120)     # 2min — risk analytics
 
 class ConnectionManager:
     def __init__(self):
@@ -60,6 +114,18 @@ engine = create_engine(DATABASE_URL)
 try:
     with engine.connect() as conn:
         conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS system_settings (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                telegram_bot_token VARCHAR(255) DEFAULT '',
+                telegram_chat_id VARCHAR(50) DEFAULT '',
+                discord_webhook_url TEXT DEFAULT '',
+                CONSTRAINT single_row CHECK (id = 1)
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO system_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
+        """))
+        conn.execute(text("""
             CREATE TABLE IF NOT EXISTS broker_accounts (
                 account_id VARCHAR(50) PRIMARY KEY,
                 broker VARCHAR(100),
@@ -69,16 +135,143 @@ try:
                 margin_free NUMERIC(15, 2),
                 margin_level NUMERIC(15, 2),
                 profit NUMERIC(15, 2),
-                last_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                last_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                max_drawdown_percent NUMERIC(5, 2) DEFAULT 5.0
             )
+        """))
+        conn.execute(text("""
+            ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS max_drawdown_percent NUMERIC(5, 2) DEFAULT 5.0;
         """))
         conn.execute(text("""
             ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS parent_article_id INTEGER;
         """))
+        conn.execute(text("""
+            ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS ml_prediction_prob NUMERIC(5, 4) DEFAULT 0.50;
+        """))
+        
+        # Create users table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(100) UNIQUE NOT NULL,
+                hashed_password VARCHAR(255) NOT NULL,
+                role VARCHAR(20) DEFAULT 'Trader',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
+        # Seed default admin user (admin / admin123) if no users exist
+        user_count = conn.execute(text("SELECT COUNT(*) FROM users")).scalar()
+        if user_count == 0:
+            from auth import get_password_hash
+            admin_hash = get_password_hash("admin123")
+            conn.execute(
+                text("INSERT INTO users (username, hashed_password, role) VALUES ('admin', :hash, 'Admin')"),
+                {"hash": admin_hash}
+            )
+            
+        # Create orders table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id VARCHAR(50) PRIMARY KEY,
+                account_id VARCHAR(50) NOT NULL,
+                ticker VARCHAR(20) NOT NULL,
+                action VARCHAR(10) NOT NULL,
+                status VARCHAR(20) NOT NULL,
+                requested_price NUMERIC(15, 4),
+                executed_price NUMERIC(15, 4),
+                slippage NUMERIC(15, 4) DEFAULT 0.0,
+                commission NUMERIC(15, 4) DEFAULT 0.0,
+                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        
+        # Create ml_model_metrics table
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ml_model_metrics (
+                ticker VARCHAR(20) PRIMARY KEY,
+                last_trained TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                accuracy NUMERIC(5, 4),
+                precision NUMERIC(5, 4),
+                recall NUMERIC(5, 4),
+                f1_score NUMERIC(5, 4),
+                total_samples INTEGER,
+                features_used JSONB DEFAULT '[]'
+            )
+        """))
+        
+        # Range Partitioning for stock_prices (Check if relkind is 'p' - partitioned)
+        relkind_row = conn.execute(text("""
+            SELECT relkind FROM pg_class WHERE relname = 'stock_prices'
+        """)).fetchone()
+        
+        if relkind_row and relkind_row[0] != 'p':
+            print("Migrating stock_prices table to Range Partitioned schema...")
+            # 1. Rename old table
+            conn.execute(text("ALTER TABLE stock_prices RENAME TO stock_prices_old"))
+            # 2. Create partitioned table
+            conn.execute(text("""
+                CREATE TABLE stock_prices (
+                    id SERIAL,
+                    ticker VARCHAR(20) REFERENCES companies(ticker) ON DELETE CASCADE,
+                    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+                    open NUMERIC(15, 4),
+                    high NUMERIC(15, 4),
+                    low NUMERIC(15, 4),
+                    close NUMERIC(15, 4),
+                    volume BIGINT,
+                    rsi NUMERIC(8, 4),
+                    macd NUMERIC(15, 4),
+                    macd_signal NUMERIC(15, 4),
+                    sma_20 NUMERIC(15, 4),
+                    sma_50 NUMERIC(15, 4),
+                    sma_200 NUMERIC(15, 4),
+                    adx NUMERIC(15, 4),
+                    atr NUMERIC(15, 4),
+                    PRIMARY KEY (ticker, timestamp)
+                ) PARTITION BY RANGE (timestamp)
+            """))
+            # 3. Create partitions
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS stock_prices_y2025 PARTITION OF stock_prices
+                    FOR VALUES FROM ('2025-01-01 00:00:00+00') TO ('2026-01-01 00:00:00+00')
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS stock_prices_y2026 PARTITION OF stock_prices
+                    FOR VALUES FROM ('2026-01-01 00:00:00+00') TO ('2027-01-01 00:00:00+00')
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS stock_prices_default PARTITION OF stock_prices DEFAULT
+            """))
+            # 4. Migrate data
+            conn.execute(text("""
+                INSERT INTO stock_prices (ticker, timestamp, open, high, low, close, volume, rsi, macd, macd_signal, sma_20, sma_50, sma_200, adx, atr)
+                SELECT ticker, timestamp, open, high, low, close, volume, rsi, macd, macd_signal, sma_20, sma_50, sma_200, adx, atr
+                FROM stock_prices_old
+                ON CONFLICT (ticker, timestamp) DO NOTHING
+            """))
+            # 5. Drop old table
+            conn.execute(text("DROP TABLE stock_prices_old"))
+        
+        # Performance indexes — safe to run multiple times (IF NOT EXISTS)
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_stock_prices_ticker_ts
+            ON stock_prices (ticker, timestamp DESC)
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_news_articles_published
+            ON news_articles (published_date DESC)
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_recommendations_signal
+            ON recommendations (signal)
+        """))
         conn.commit()
 
 except Exception as e:
-    print(f"Error creating broker_accounts table: {e}")
+    import traceback
+    traceback.print_exc()
+    print(f"Error initializing database schema/partitioning: {e}")
 
 # Global tracker for MT5 clients and manual overrides
 mt5_clients = {}
@@ -87,8 +280,13 @@ manual_overrides = {}
 # Centralized Risk Parameters
 max_drawdown_percent = 5.0
 emergency_kill_switch = False
+last_risk_state = False
+last_risk_reason = ""
 
 class RiskSettingsPayload(BaseModel):
+    max_drawdown_percent: float
+
+class AccountRiskPayload(BaseModel):
     max_drawdown_percent: float
 
 class KillSwitchPayload(BaseModel):
@@ -138,6 +336,7 @@ class ScreenerRow(BaseModel):
     sentiment_score: float
     signal: str # STRONG BUY, BUY, HOLD, SELL, STRONG SELL
     timestamp: datetime
+    ml_prediction_prob: float = 0.50
 
 class StockDetailResponse(BaseModel):
     ticker: str
@@ -159,6 +358,7 @@ class StockDetailResponse(BaseModel):
     mt5_symbol: str
     stop_loss: float
     take_profit: float
+    ml_prediction_prob: float = 0.50
 
 class NewsArticleSchema(BaseModel):
     id: int
@@ -179,7 +379,7 @@ def get_index_performance(ticker: str) -> dict:
         with engine.connect() as conn:
             query = text("""
                 SELECT close, timestamp FROM stock_prices
-                WHERE ticker = :ticker
+                WHERE ticker = :ticker AND close IS NOT NULL
                 ORDER BY timestamp DESC
                 LIMIT 2
             """)
@@ -208,6 +408,11 @@ def get_index_performance(ticker: str) -> dict:
 
 @app.get("/api/market-summary", response_model=MarketSummaryResponse)
 def get_market_summary():
+    # Check cache first
+    cached = _cache_market_summary.get("market_summary")
+    if cached is not None:
+        return cached
+
     indices_tickers = {
         "^STOXX": "STOXX Europe 600",
         "^GDAXI": "DAX 40",
@@ -263,22 +468,30 @@ def get_market_summary():
         status = "SAFE"
         message = "Volatility environment is safe for standard execution."
         
-    return MarketSummaryResponse(
+    result = MarketSummaryResponse(
         indices=indices_list,
         v2tx=VolatilitySummary(
-            price=round(v2tx_price, 2) if v2tx_price > 0.0 else 18.50, # fallback default
+            price=round(v2tx_price, 2) if v2tx_price > 0.0 else 18.50,
             status=status,
             message=message
         ),
         forex=forex_list
     )
+    _cache_market_summary["market_summary"] = result
+    return result
 
 @app.get("/api/screener", response_model=List[ScreenerRow])
 def get_screener():
+    # Check cache
+    cached = _cache_screener.get("screener_all")
+    if cached is not None:
+        return cached
+
     query = text("""
         SELECT c.ticker, c.name, c.country, c.sector,
                r.signal, r.sentiment_score, r.price_change_24h, r.timestamp,
-               (SELECT close FROM stock_prices p WHERE p.ticker = c.ticker ORDER BY p.timestamp DESC LIMIT 1) as latest_close
+               (SELECT close FROM stock_prices p WHERE p.ticker = c.ticker AND p.close IS NOT NULL ORDER BY p.timestamp DESC LIMIT 1) as latest_close,
+               r.ml_prediction_prob
         FROM companies c
         JOIN recommendations r ON c.ticker = r.ticker
         WHERE c.sector NOT IN ('Index', 'Forex')
@@ -290,7 +503,7 @@ def get_screener():
         
     rows = []
     for r in result:
-        ticker, name, country, sector, signal, sent_score, change_24h, ts, price = r
+        ticker, name, country, sector, signal, sent_score, change_24h, ts, price, ml_prob = r
         rows.append(
             ScreenerRow(
                 ticker=ticker,
@@ -301,9 +514,11 @@ def get_screener():
                 price_change_24h=float(change_24h) if change_24h else 0.0,
                 sentiment_score=float(sent_score) if sent_score else 0.0,
                 signal=signal,
-                timestamp=ts
+                timestamp=ts,
+                ml_prediction_prob=float(ml_prob) if ml_prob is not None else 0.50
             )
         )
+    _cache_screener["screener_all"] = rows
     return rows
 
 @app.get("/api/stock/{ticker}", response_model=StockDetailResponse)
@@ -323,7 +538,7 @@ def get_stock_detail(ticker: str):
         # Fetch recommendation details
         rec = conn.execute(
             text("""
-                SELECT signal, sentiment_score, price_change_24h, reason_macro, reason_micro, reason_technical
+                SELECT signal, sentiment_score, price_change_24h, reason_macro, reason_micro, reason_technical, ml_prediction_prob
                 FROM recommendations
                 WHERE ticker = :ticker
             """),
@@ -336,16 +551,18 @@ def get_stock_detail(ticker: str):
         reason_macro = "No analysis available yet."
         reason_micro = "No analysis available yet."
         reason_technical = "No analysis available yet."
+        ml_prob = 0.50
         
         if rec:
-            signal, sent_score, change_24h, reason_macro, reason_micro, reason_technical = rec
+            signal, sent_score, change_24h, reason_macro, reason_micro, reason_technical, ml_prob_val = rec
+            ml_prob = float(ml_prob_val) if ml_prob_val is not None else 0.50
             
         # Fetch price history (last 100 rows for rich charts)
         prices = conn.execute(
             text("""
                 SELECT timestamp, open, high, low, close, volume, rsi, macd, macd_signal, sma_20, sma_50, sma_200
                 FROM stock_prices
-                WHERE ticker = :ticker
+                WHERE ticker = :ticker AND close IS NOT NULL
                 ORDER BY timestamp ASC
                 LIMIT 100
             """),
@@ -376,7 +593,7 @@ def get_stock_detail(ticker: str):
         stock_prices_60 = conn.execute(
             text("""
                 SELECT close, timestamp FROM stock_prices
-                WHERE ticker = :ticker
+                WHERE ticker = :ticker AND close IS NOT NULL
                 ORDER BY timestamp DESC
                 LIMIT 61
             """),
@@ -386,7 +603,7 @@ def get_stock_detail(ticker: str):
         market_prices_60 = conn.execute(
             text("""
                 SELECT close, timestamp FROM stock_prices
-                WHERE ticker = '^STOXX'
+                WHERE ticker = '^STOXX' AND close IS NOT NULL
                 ORDER BY timestamp DESC
                 LIMIT 61
             """),
@@ -485,7 +702,7 @@ def get_stock_detail(ticker: str):
             text("""
                 SELECT high, low, close
                 FROM stock_prices
-                WHERE ticker = :ticker
+                WHERE ticker = :ticker AND close IS NOT NULL
                 ORDER BY timestamp DESC
                 LIMIT 15
             """),
@@ -540,7 +757,8 @@ def get_stock_detail(ticker: str):
             hedging_suggestion=hedging_suggestion,
             mt5_symbol=mt5_symbol,
             stop_loss=sl,
-            take_profit=tp
+            take_profit=tp,
+            ml_prediction_prob=ml_prob
         )
 
 @app.get("/api/news", response_model=List[NewsArticleSchema])
@@ -584,9 +802,9 @@ def get_news():
         return articles
 
 @app.post("/api/trigger-job")
-def trigger_job():
+def trigger_job(request: Request, current_user: dict = Depends(require_admin)):
     """
-    Inserts a job into the queue to trigger the scraping and calculation worker.
+    Admin only: Inserts a job into the queue to trigger the scraping and calculation worker.
     """
     with engine.connect() as conn:
         # Create queue table if not exists
@@ -602,7 +820,9 @@ def trigger_job():
         # Insert pending job
         conn.execute(text("INSERT INTO job_queue (status) VALUES ('pending')"))
         conn.commit()
-        
+
+    ip = request.client.host if request.client else "unknown"
+    write_audit_log(current_user["username"], "trigger_job", {"queued": True}, ip)
     return {"message": "Job successfully queued. Worker will execute immediately."}
 
 class BacktestRequest(BaseModel):
@@ -611,6 +831,7 @@ class BacktestRequest(BaseModel):
     sell_rsi: float = 70.0
     buy_sentiment: float = 0.1
     sell_sentiment: float = -0.1
+    initial_capital: float = 10000.0  # Configurable starting capital
 
 class BacktestResponse(BaseModel):
     total_return: float
@@ -621,13 +842,14 @@ class BacktestResponse(BaseModel):
     equity_curve: List[dict]
 
 @app.post("/api/backtest", response_model=BacktestResponse)
-def run_backtest(req: BacktestRequest):
+@limiter.limit("10/minute")
+def run_backtest(request: Request, req: BacktestRequest):
     with engine.connect() as conn:
         prices = conn.execute(
             text("""
                 SELECT timestamp, close, rsi
                 FROM stock_prices
-                WHERE ticker = :ticker
+                WHERE ticker = :ticker AND close IS NOT NULL
                 ORDER BY timestamp ASC
                 LIMIT 250
             """),
@@ -656,9 +878,10 @@ def run_backtest(req: BacktestRequest):
             sent_by_date[d_str].append(score)
         avg_sent_by_date = {d: sum(vals)/len(vals) for d, vals in sent_by_date.items()}
         
-        cash = 10000.0
+        initial_capital = max(100.0, min(req.initial_capital, 10_000_000.0))  # clamp between €100-€10M
+        cash = initial_capital
         position = 0.0
-        peak_equity = 10000.0
+        peak_equity = initial_capital
         max_drawdown = 0.0
         trades = 0
         winning_trades = 0
@@ -680,14 +903,21 @@ def run_backtest(req: BacktestRequest):
                 
             if position == 0.0:
                 if rsi_val <= req.buy_rsi or sentiment_val >= req.buy_sentiment:
-                    position = cash / close_val
+                    # Incorporate slippage (entry price is slightly higher) & commission (0.1%)
+                    executed_buy_price = close_val * 1.0005
+                    commission_cost = cash * 0.001
+                    position = (cash - commission_cost) / executed_buy_price
                     cash = 0.0
-                    entry_price = close_val
+                    entry_price = executed_buy_price
             elif position > 0.0:
                 if rsi_val >= req.sell_rsi or sentiment_val <= req.sell_sentiment:
-                    cash = position * close_val
+                    # Incorporate slippage (exit price is slightly lower) & commission (0.1%)
+                    executed_sell_price = close_val * 0.9995
+                    gross_cash = position * executed_sell_price
+                    commission_cost = gross_cash * 0.001
+                    cash = gross_cash - commission_cost
                     position = 0.0
-                    exit_price = close_val
+                    exit_price = executed_sell_price
                     trades += 1
                     if exit_price > entry_price:
                         winning_trades += 1
@@ -705,10 +935,13 @@ def run_backtest(req: BacktestRequest):
                 max_drawdown = drawdown
                 
         if position > 0.0:
-            cash = position * final_close
+            executed_sell_price = final_close * 0.9995
+            gross_cash = position * executed_sell_price
+            commission_cost = gross_cash * 0.001
+            cash = gross_cash - commission_cost
             position = 0.0
             trades += 1
-            if final_close > entry_price:
+            if executed_sell_price > entry_price:
                 winning_trades += 1
             current_equity = cash
             if current_equity > peak_equity:
@@ -719,7 +952,7 @@ def run_backtest(req: BacktestRequest):
             if len(equity_curve) > 0:
                 equity_curve[-1]["equity"] = round(current_equity, 2)
                 
-        total_return = ((current_equity - 10000.0) / 10000.0) * 100.0
+        total_return = ((current_equity - initial_capital) / initial_capital) * 100.0
         benchmark_return = ((final_close - initial_close) / initial_close) * 100.0
         win_rate = (winning_trades / trades * 100.0) if trades > 0 else 0.0
         
@@ -747,61 +980,231 @@ def run_backtest(req: BacktestRequest):
             equity_curve=equity_curve
         )
 
+class BacktestOptimizeRequest(BaseModel):
+    ticker: str
+
+class OptimizationItem(BaseModel):
+    buy_rsi: float
+    sell_rsi: float
+    buy_sentiment: float
+    sell_sentiment: float
+    total_return: float
+    benchmark_return: float
+    max_drawdown: float
+    sharpe_ratio: float
+    win_rate: float
+
+class BacktestOptimizeResponse(BaseModel):
+    ticker: str
+    top_configs: List[OptimizationItem]
+
+@app.post("/api/backtest/optimize", response_model=BacktestOptimizeResponse)
+@limiter.limit("3/minute")
+def run_backtest_optimize(request: Request, req: BacktestOptimizeRequest):
+    with engine.connect() as conn:
+        prices = conn.execute(
+            text("""
+                SELECT timestamp, close, rsi
+                FROM stock_prices
+                WHERE ticker = :ticker AND close IS NOT NULL
+                ORDER BY timestamp ASC
+                LIMIT 250
+            """),
+            {"ticker": req.ticker}
+        ).fetchall()
+        
+        if not prices:
+            raise HTTPException(status_code=404, detail="No price data available for backtest")
+            
+        sent_rows = conn.execute(
+            text("""
+                SELECT a.published_date, a.sentiment_score
+                FROM news_articles a
+                JOIN news_company_mappings m ON a.id = m.article_id
+                WHERE m.company_ticker = :ticker AND a.sentiment_score IS NOT NULL
+            """),
+            {"ticker": req.ticker}
+        ).fetchall()
+        
+        sent_by_date = {}
+        for r in sent_rows:
+            d_str = r[0].strftime("%Y-%m-%d")
+            score = float(r[1])
+            if d_str not in sent_by_date:
+                sent_by_date[d_str] = []
+            sent_by_date[d_str].append(score)
+        avg_sent_by_date = {d: sum(vals)/len(vals) for d, vals in sent_by_date.items()}
+        
+        initial_close = float(prices[0][1]) if prices[0][1] else 1.0
+        final_close = float(prices[-1][1]) if prices[-1][1] else 1.0
+        benchmark_return = ((final_close - initial_close) / initial_close) * 100.0
+        
+        # Grid parameters
+        buy_rsi_vals = [20.0, 25.0, 30.0, 35.0]
+        sell_rsi_vals = [65.0, 70.0, 75.0, 80.0]
+        buy_sent_vals = [0.05, 0.1, 0.2, 0.3]
+        sell_sent_vals = [-0.05, -0.1, -0.2, -0.3]
+        
+        results = []
+        
+        for buy_rsi in buy_rsi_vals:
+            for sell_rsi in sell_rsi_vals:
+                for buy_sent in buy_sent_vals:
+                    for sell_sent in sell_sent_vals:
+                        # Run backtest simulation in-memory
+                        cash = 10000.0
+                        position = 0.0
+                        peak_equity = 10000.0
+                        max_drawdown = 0.0
+                        trades = 0
+                        winning_trades = 0
+                        entry_price = 0.0
+                        
+                        equity_curve = []
+                        
+                        for p in prices:
+                            ts, close, rsi = p
+                            close_val = float(close) if close else 0.0
+                            rsi_val = float(rsi) if rsi else 50.0
+                            d_str = ts.strftime("%Y-%m-%d")
+                            sentiment_val = avg_sent_by_date.get(d_str, 0.0)
+                            
+                            if close_val <= 0.0:
+                                continue
+                                
+                            if position == 0.0:
+                                if rsi_val <= buy_rsi or sentiment_val >= buy_sent:
+                                    position = cash / close_val
+                                    cash = 0.0
+                                    entry_price = close_val
+                            elif position > 0.0:
+                                if rsi_val >= sell_rsi or sentiment_val <= sell_sent:
+                                    cash = position * close_val
+                                    position = 0.0
+                                    exit_price = close_val
+                                    trades += 1
+                                    if exit_price > entry_price:
+                                        winning_trades += 1
+                                        
+                            current_equity = cash + (position * close_val)
+                            equity_curve.append(current_equity)
+                            
+                            if current_equity > peak_equity:
+                                peak_equity = current_equity
+                            drawdown = ((peak_equity - current_equity) / peak_equity) * 100.0
+                            if drawdown > max_drawdown:
+                                max_drawdown = drawdown
+                                
+                        if position > 0.0:
+                            cash = position * final_close
+                            position = 0.0
+                            trades += 1
+                            if final_close > entry_price:
+                                winning_trades += 1
+                            current_equity = cash
+                            if current_equity > peak_equity:
+                                peak_equity = current_equity
+                            drawdown = ((peak_equity - current_equity) / peak_equity) * 100.0
+                            if drawdown > max_drawdown:
+                                max_drawdown = drawdown
+                            if equity_curve:
+                                equity_curve[-1] = current_equity
+                                
+                        total_return = ((current_equity - 10000.0) / 10000.0) * 100.0
+                        win_rate = (winning_trades / trades * 100.0) if trades > 0 else 0.0
+                        
+                        # Sharpe
+                        sharpe_ratio = 0.0
+                        if len(equity_curve) >= 5:
+                            daily_returns = []
+                            for i in range(1, len(equity_curve)):
+                                prev = equity_curve[i-1]
+                                curr = equity_curve[i]
+                                if prev > 0:
+                                    daily_returns.append((curr - prev) / prev)
+                            if daily_returns:
+                                mean_ret = sum(daily_returns) / len(daily_returns)
+                                variance = sum((r - mean_ret) ** 2 for r in daily_returns) / len(daily_returns)
+                                std_ret = variance ** 0.5
+                                if std_ret > 0:
+                                    sharpe_ratio = round((mean_ret / std_ret) * (252 ** 0.5), 2)
+                                    
+                        results.append(OptimizationItem(
+                            buy_rsi=buy_rsi,
+                            sell_rsi=sell_rsi,
+                            buy_sentiment=buy_sentiment,
+                            sell_sentiment=sell_sentiment,
+                            total_return=round(total_return, 2),
+                            benchmark_return=round(benchmark_return, 2),
+                            max_drawdown=round(max_drawdown, 2),
+                            sharpe_ratio=sharpe_ratio,
+                            win_rate=round(win_rate, 2)
+                        ))
+                        
+        # Sort by sharpe_ratio descending, then total_return descending
+        results.sort(key=lambda x: (x.sharpe_ratio, x.total_return), reverse=True)
+        
+        return BacktestOptimizeResponse(
+            ticker=req.ticker,
+            top_configs=results[:3]
+        )
+
 from fastapi.responses import StreamingResponse
 import asyncio
 import json
-import random
+
+# Forex tickers reference map
+FOREX_TICKERS = {
+    "EURUSD=X": "EUR/USD",
+    "GBPUSD=X": "GBP/USD",
+    "EURGBP=X": "EUR/GBP",
+    "EURJPY=X": "EUR/JPY",
+    "EURCHF=X": "EUR/CHF",
+}
 
 @app.get("/api/events")
 async def get_events():
+    """SSE stream with real forex prices from DB, refreshed every 10 seconds."""
     async def event_generator():
-        baselines = {
-            "EURUSD=X": {"name": "EUR/USD", "price": 1.1528, "change_pct": 0.04},
-            "GBPUSD=X": {"name": "GBP/USD", "price": 1.3333, "change_pct": -0.02},
-            "EURGBP=X": {"name": "EUR/GBP", "price": 0.8645, "change_pct": 0.06},
-            "EURJPY=X": {"name": "EUR/JPY", "price": 184.65, "change_pct": -0.04},
-            "EURCHF=X": {"name": "EUR/CHF", "price": 0.9201, "change_pct": 0.26}
-        }
-        
-        try:
-            with engine.connect() as conn:
-                res = conn.execute(text("""
-                    SELECT ticker, price, change_pct, name
-                    FROM (
-                        SELECT ticker, close as price, change_pct, name,
-                               ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY timestamp DESC) as rn
-                        FROM stock_prices
-                        WHERE sector = 'Forex'
-                    ) tmp WHERE rn = 1
-                """)).fetchall()
-                for r in res:
-                    ticker, price, change, name = r
-                    if price:
-                        baselines[ticker] = {
-                            "name": name or ticker,
-                            "price": float(price),
-                            "change_pct": float(change) if change else 0.0
-                        }
-        except Exception:
-            pass
-
         while True:
-            forex_updates = []
-            for ticker, data in baselines.items():
-                tick = 1.0 + random.uniform(-0.0002, 0.0002)
-                data["price"] = round(data["price"] * tick, 4)
-                data["change_pct"] = round(data["change_pct"] + random.uniform(-0.01, 0.01), 2)
-                forex_updates.append({
-                    "ticker": ticker,
-                    "name": data["name"],
-                    "price": data["price"],
-                    "change_pct": data["change_pct"]
-                })
-            
-            yield f"data: {json.dumps({'forex': forex_updates})}\n\n"
-            await asyncio.sleep(5)
-            
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+            try:
+                forex_updates = []
+                with engine.connect() as conn:
+                    for fx_ticker, fx_name in FOREX_TICKERS.items():
+                        row = conn.execute(text("""
+                            SELECT sp1.close, sp2.close
+                            FROM (
+                                SELECT close FROM stock_prices
+                                WHERE ticker = :ticker AND close IS NOT NULL
+                                ORDER BY timestamp DESC LIMIT 1
+                            ) sp1,
+                            (
+                                SELECT close FROM stock_prices
+                                WHERE ticker = :ticker AND close IS NOT NULL
+                                ORDER BY timestamp DESC LIMIT 1 OFFSET 1
+                            ) sp2
+                        """), {"ticker": fx_ticker}).fetchone()
+
+                        if row and row[0]:
+                            latest = float(row[0])
+                            prev = float(row[1]) if row[1] else latest
+                            change_pct = round(((latest - prev) / prev) * 100.0, 4) if prev else 0.0
+                            forex_updates.append({
+                                "ticker": fx_ticker,
+                                "name": fx_name,
+                                "price": round(latest, 5),
+                                "change_pct": change_pct
+                            })
+
+                if forex_updates:
+                    yield f"data: {json.dumps({'forex': forex_updates})}\n\n"
+            except Exception as e:
+                print(f"SSE events error: {e}")
+
+            await asyncio.sleep(10)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 class MT5Signal(BaseModel):
     ticker: str
@@ -883,6 +1286,7 @@ async def get_mt5_signals(
                     JOIN (
                         SELECT ticker, close, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY timestamp DESC) as rn
                         FROM stock_prices
+                        WHERE close IS NOT NULL
                     ) p ON r.ticker = p.ticker AND p.rn = 1
                     WHERE r.ticker = :ticker OR 
                           REPLACE(REPLACE(REPLACE(split_part(r.ticker, '.', 1), '=X', ''), '^', ''), ' ', '') = :ticker
@@ -899,6 +1303,7 @@ async def get_mt5_signals(
                     JOIN (
                         SELECT ticker, close, ROW_NUMBER() OVER(PARTITION BY ticker ORDER BY timestamp DESC) as rn
                         FROM stock_prices
+                        WHERE close IS NOT NULL
                     ) p ON r.ticker = p.ticker AND p.rn = 1
                     ORDER BY r.timestamp DESC
                 """)
@@ -913,12 +1318,49 @@ async def get_mt5_signals(
             if total_bal > total_eq:
                 current_drawdown_pct = ((total_bal - total_eq) / total_bal) * 100.0
         
-        is_risk_triggered = (current_drawdown_pct > max_drawdown_percent) or emergency_kill_switch
+        specific_risk_triggered = False
+        specific_risk_reason = ""
+        if account:
+            account_row = conn.execute(
+                text("SELECT balance, equity, max_drawdown_percent FROM broker_accounts WHERE account_id = :account_id"),
+                {"account_id": account}
+            ).fetchone()
+            if account_row:
+                acc_bal = float(account_row[0]) if account_row[0] else 0.0
+                acc_eq = float(account_row[1]) if account_row[1] else 0.0
+                acc_max_dd = float(account_row[2]) if account_row[2] is not None else 5.0
+                if acc_bal > 0 and acc_bal > acc_eq:
+                    acc_dd_pct = ((acc_bal - acc_eq) / acc_bal) * 100.0
+                    if acc_dd_pct > acc_max_dd:
+                        specific_risk_triggered = True
+                        specific_risk_reason = f"DRAWDOWN ACCOUNT {account} ({acc_dd_pct:.2f}%) SUPERA IL LIMITE INDIVIDUALE ({acc_max_dd:.2f}%)"
+                        
+        global last_risk_state, last_risk_reason
+        is_risk_triggered = (current_drawdown_pct > max_drawdown_percent) or emergency_kill_switch or specific_risk_triggered
         risk_reason = ""
         if emergency_kill_switch:
             risk_reason = "EMERGENCY KILL-SWITCH ATTIVATO DA DASHBOARD"
         elif current_drawdown_pct > max_drawdown_percent:
             risk_reason = f"DRAWDOWN ATTUALE ({current_drawdown_pct:.2f}%) SUPERA IL LIMITE ({max_drawdown_percent:.2f}%)"
+        elif specific_risk_triggered:
+            risk_reason = specific_risk_reason
+
+        # State transition triggers notification
+        if is_risk_triggered and not last_risk_state:
+            last_risk_state = True
+            last_risk_reason = risk_reason
+            send_system_notifications(
+                f"🚨 <b>EuroQuant Risk Safeguard TRIGGERED</b>\n"
+                f"Status: CLOSE_ALL forced downstream.\n"
+                f"Reason: {risk_reason}"
+            )
+        elif not is_risk_triggered and last_risk_state:
+            last_risk_state = False
+            last_risk_reason = ""
+            send_system_notifications(
+                f"✅ <b>EuroQuant Risk Safeguard CLEARED</b>\n"
+                f"Status: Normal trading resumed."
+            )
 
         signals = []
         for r_ticker, r_signal, r_reason, r_price, r_gen, r_adx, r_atr, r_vol in rows:
@@ -952,7 +1394,7 @@ async def get_mt5_signals(
                 text("""
                     SELECT high, low, close
                     FROM stock_prices
-                    WHERE ticker = :ticker
+                    WHERE ticker = :ticker AND close IS NOT NULL
                     ORDER BY timestamp DESC
                     LIMIT 15
                 """),
@@ -977,6 +1419,8 @@ async def get_mt5_signals(
                 if tr_list:
                     atr = sum(tr_list) / len(tr_list)
             
+            if r_price is None:
+                continue
             latest_price = float(r_price)
             mt5_symbol = r_ticker.split(".")[0].replace("=X", "").replace("^", "")
             
@@ -1030,7 +1474,7 @@ def get_forex_screener():
     query = text("""
         SELECT c.ticker, c.name, c.country, c.sector,
                r.signal, r.sentiment_score, r.price_change_24h, r.timestamp,
-               (SELECT close FROM stock_prices p WHERE p.ticker = c.ticker ORDER BY p.timestamp DESC LIMIT 1) as latest_close
+               (SELECT close FROM stock_prices p WHERE p.ticker = c.ticker AND p.close IS NOT NULL ORDER BY p.timestamp DESC LIMIT 1) as latest_close
         FROM companies c
         JOIN recommendations r ON c.ticker = r.ticker
         WHERE c.sector = 'Forex'
@@ -1089,16 +1533,18 @@ def get_broker_accounts():
         return []
 
 @app.post("/api/mt5/overrides")
-async def set_override(payload: OverridePayload):
+async def set_override(payload: OverridePayload, current_user: dict = Depends(get_current_user)):
     ticker = payload.ticker
     action = payload.action
     if action == "CLEAR":
         manual_overrides.pop(ticker, None)
+        send_system_notifications(f"ℹ️ <b>EuroQuant Manual Override</b>\nOverride for <code>{ticker}</code> cleared by user <b>{current_user['username']}</b>.")
     else:
         manual_overrides[ticker] = {
             "action": action,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
+        send_system_notifications(f"⚠️ <b>EuroQuant Manual Override FORCE</b>\nOverride for <code>{ticker}</code> set to <b>{action}</b> by user <b>{current_user['username']}</b>.")
     await manager.broadcast({"type": "overrides_update"})
     return {"status": "success", "overrides": manual_overrides}
 
@@ -1131,7 +1577,7 @@ def get_recommendations_history(ticker: str):
 
 @app.get("/api/mt5/risk")
 def get_risk_settings():
-    # Calculate current aggregate drawdown
+    # Calculate current aggregate drawdown and fetch all accounts
     with engine.connect() as conn:
         acc_stats = conn.execute(text("SELECT SUM(balance), SUM(equity) FROM broker_accounts")).fetchone()
         current_drawdown_pct = 0.0
@@ -1141,23 +1587,932 @@ def get_risk_settings():
             if total_bal > total_eq:
                 current_drawdown_pct = ((total_bal - total_eq) / total_bal) * 100.0
                 
+        accounts_rows = conn.execute(text("SELECT account_id, broker, balance, equity, profit, max_drawdown_percent FROM broker_accounts")).fetchall()
+        accounts_data = []
+        for r in accounts_rows:
+            acc_id, broker, bal, eq, prof, max_dd = r
+            bal_val = float(bal) if bal else 0.0
+            eq_val = float(eq) if eq else 0.0
+            dd = ((bal_val - eq_val) / bal_val * 100.0) if bal_val > eq_val and bal_val > 0 else 0.0
+            accounts_data.append({
+                "account_id": acc_id,
+                "broker": broker or "Unknown",
+                "balance": bal_val,
+                "equity": eq_val,
+                "profit": float(prof) if prof else 0.0,
+                "max_drawdown_percent": float(max_dd) if max_dd is not None else 5.0,
+                "current_drawdown_percent": round(dd, 2)
+            })
+                
     return {
         "max_drawdown_percent": max_drawdown_percent,
         "emergency_kill_switch": emergency_kill_switch,
-        "current_drawdown_percent": round(current_drawdown_pct, 2)
+        "current_drawdown_percent": round(current_drawdown_pct, 2),
+        "accounts": accounts_data
     }
 
 @app.post("/api/mt5/risk")
-async def update_risk_settings(payload: RiskSettingsPayload):
+async def update_risk_settings(request: Request, payload: RiskSettingsPayload, current_user: dict = Depends(require_admin)):
+    """Admin only: updates global max drawdown risk threshold."""
     global max_drawdown_percent
     max_drawdown_percent = payload.max_drawdown_percent
+    ip = request.client.host if request.client else "unknown"
+    write_audit_log(current_user["username"], "risk_settings_updated",
+                    {"max_drawdown_percent": payload.max_drawdown_percent}, ip)
+    send_system_notifications(f"🛡️ <b>EuroQuant Risk System</b>\nMax drawdown limit updated to {max_drawdown_percent}% by admin user <b>{current_user['username']}</b>.")
     await manager.broadcast({"type": "risk_update"})
     return {"status": "success", "max_drawdown_percent": max_drawdown_percent}
 
 @app.post("/api/mt5/risk/kill-switch")
-async def toggle_kill_switch(payload: KillSwitchPayload):
+async def toggle_kill_switch(request: Request, payload: KillSwitchPayload, current_user: dict = Depends(require_admin)):
+    """Admin only: activates or deactivates the emergency kill switch."""
     global emergency_kill_switch
     emergency_kill_switch = payload.active
+    ip = request.client.host if request.client else "unknown"
+    write_audit_log(current_user["username"], "kill_switch_toggled",
+                    {"active": payload.active}, ip)
+    status_text = "ATTIVATO" if emergency_kill_switch else "DISATTIVATO"
+    send_system_notifications(f"⚠️ <b>EuroQuant EMERGENCY ALERT</b>\nKill switch <b>{status_text}</b> by admin user <b>{current_user['username']}</b>!")
     await manager.broadcast({"type": "risk_update"})
     return {"status": "success", "emergency_kill_switch": emergency_kill_switch}
+
+@app.post("/api/mt5/accounts/{account_id}/risk")
+async def update_account_risk_settings(account_id: str, request: Request, payload: AccountRiskPayload, current_user: dict = Depends(require_admin)):
+    """Admin only: updates per-account drawdown limit."""
+    with engine.connect() as conn:
+        conn.execute(
+            text("UPDATE broker_accounts SET max_drawdown_percent = :max_dd WHERE account_id = :account_id"),
+            {"max_dd": payload.max_drawdown_percent, "account_id": account_id}
+        )
+        conn.commit()
+    ip = request.client.host if request.client else "unknown"
+    write_audit_log(current_user["username"], "account_risk_updated",
+                    {"account_id": account_id, "max_drawdown_percent": payload.max_drawdown_percent}, ip)
+    send_system_notifications(f"🛡️ <b>EuroQuant Risk System</b>\nAccount <code>{account_id}</code> drawdown limit updated to {payload.max_drawdown_percent}% by admin <b>{current_user['username']}</b>.")
+    await manager.broadcast({"type": "risk_update"})
+    return {"status": "success", "account_id": account_id, "max_drawdown_percent": payload.max_drawdown_percent}
+
+class SystemSettingsPayload(BaseModel):
+    telegram_bot_token: str
+    telegram_chat_id: str
+    discord_webhook_url: str
+
+class PortfolioBacktestRequest(BaseModel):
+    tickers: List[str]
+    capital: float = 10000.0
+    buy_rsi: float = 30.0
+    sell_rsi: float = 70.0
+    buy_sentiment: float = 0.3
+    sell_sentiment: float = -0.3
+
+class PortfolioBacktestResponse(BaseModel):
+    initial_capital: float
+    final_capital: float
+    total_return_percent: float
+    max_drawdown: float
+    win_rate: float
+    total_trades: int
+    equity_curve: List[dict]
+
+@app.get("/api/system-settings")
+def get_system_settings():
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT telegram_bot_token, telegram_chat_id, discord_webhook_url FROM system_settings WHERE id = 1")).fetchone()
+        if row:
+            from crypto_utils import decrypt_data
+            return {
+                "telegram_bot_token": decrypt_data(row[0]) or "",
+                "telegram_chat_id": decrypt_data(row[1]) or "",
+                "discord_webhook_url": decrypt_data(row[2]) or ""
+            }
+    return {"telegram_bot_token": "", "telegram_chat_id": "", "discord_webhook_url": ""}
+
+@app.post("/api/system-settings")
+def update_system_settings(request: Request, payload: SystemSettingsPayload, current_user: dict = Depends(require_admin)):
+    """Admin only: updates Telegram/Discord alert credentials."""
+    from crypto_utils import encrypt_data
+    with engine.connect() as conn:
+        conn.execute(text("""
+            UPDATE system_settings
+            SET telegram_bot_token = :tg_token,
+                telegram_chat_id = :tg_chat,
+                discord_webhook_url = :discord_url
+            WHERE id = 1
+        """), {
+            "tg_token": encrypt_data(payload.telegram_bot_token),
+            "tg_chat": encrypt_data(payload.telegram_chat_id),
+            "discord_url": encrypt_data(payload.discord_webhook_url)
+        })
+        conn.commit()
+    ip = request.client.host if request.client else "unknown"
+    write_audit_log(current_user["username"], "system_settings_updated",
+                    {"telegram_configured": bool(payload.telegram_bot_token),
+                     "discord_configured": bool(payload.discord_webhook_url)}, ip)
+    return {"status": "success"}
+
+
+import urllib.request
+import threading
+
+def send_telegram_alert(message: str):
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT telegram_bot_token, telegram_chat_id FROM system_settings WHERE id = 1")).fetchone()
+            if row:
+                from crypto_utils import decrypt_data
+                token = decrypt_data(row[0])
+                chat_id = decrypt_data(row[1])
+                if token and chat_id:
+                    url = f"https://api.telegram.org/bot{token}/sendMessage"
+                    data = json.dumps({
+                        "chat_id": chat_id,
+                        "text": message,
+                        "parse_mode": "HTML"
+                    }).encode('utf-8')
+                    req = urllib.request.Request(
+                        url,
+                        data=data,
+                        headers={'Content-Type': 'application/json'}
+                    )
+                    with urllib.request.urlopen(req, timeout=5.0) as response:
+                        response.read()
+    except Exception as e:
+        print(f"Error sending Telegram alert: {e}", flush=True)
+
+def send_discord_alert(message: str):
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT discord_webhook_url FROM system_settings WHERE id = 1")).fetchone()
+            if row:
+                from crypto_utils import decrypt_data
+                webhook_url = decrypt_data(row[2])
+                if webhook_url:
+                    data = json.dumps({
+                        "content": message
+                    }).encode('utf-8')
+                    req = urllib.request.Request(
+                        webhook_url,
+                        data=data,
+                        headers={'Content-Type': 'application/json'}
+                    )
+                    with urllib.request.urlopen(req, timeout=5.0) as response:
+                        response.read()
+    except Exception as e:
+        print(f"Error sending Discord alert: {e}", flush=True)
+
+def send_system_notifications(message: str):
+    threading.Thread(target=send_telegram_alert, args=(message,), daemon=True).start()
+    threading.Thread(target=send_discord_alert, args=(message,), daemon=True).start()
+
+
+@app.get("/api/ml/metrics")
+def get_ml_metrics(current_user: dict = Depends(require_admin)):
+    """Admin only: returns accuracy, precision, and validation stats for ML models."""
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT ticker, last_trained, accuracy, precision, recall, f1_score, total_samples, features_used
+            FROM ml_model_metrics
+            ORDER BY ticker ASC
+        """)).fetchall()
+        result = []
+        for r in rows:
+            result.append({
+                "ticker": r[0],
+                "last_trained": r[1].isoformat() if r[1] else None,
+                "accuracy": float(r[2]) if r[2] is not None else 0.5,
+                "precision": float(r[3]) if r[3] is not None else 0.5,
+                "recall": float(r[4]) if r[4] is not None else 0.5,
+                "f1_score": float(r[5]) if r[5] is not None else 0.5,
+                "total_samples": r[6],
+                "features_used": json.loads(r[7]) if isinstance(r[7], str) else (r[7] or [])
+            })
+        return result
+
+
+@app.post("/api/ml/retrain")
+async def retrain_ml_models(request: Request, current_user: dict = Depends(require_admin)):
+    """Admin only: forces online retraining of GradientBoostingClassifier for all active tickers."""
+    ip = request.client.host if request.client else "unknown"
+    write_audit_log(current_user["username"], "ml_models_retrain_triggered", {}, ip)
+
+    def run_retraining():
+        try:
+            with engine.connect() as conn:
+                tickers_rows = conn.execute(text("SELECT ticker FROM companies")).fetchall()
+                tickers = [t[0] for t in tickers_rows]
+
+                from ml_engine import train_and_predict_direction
+                success_count = 0
+                for ticker in tickers:
+                    try:
+                        prob = train_and_predict_direction(ticker, conn)
+                        conn.execute(text("""
+                            UPDATE recommendations
+                            SET ml_prediction_prob = :prob,
+                                timestamp = NOW()
+                            WHERE ticker = :ticker
+                        """), {"prob": prob, "ticker": ticker})
+                        conn.commit()
+                        success_count += 1
+                    except Exception as ex:
+                        print(f"Error retraining model for {ticker}: {ex}", flush=True)
+
+                send_system_notifications(
+                    f"⚠️ <b>EuroQuant Notification</b>\n"
+                    f"ML model online retraining completed.\n"
+                    f"Successfully updated models for {success_count}/{len(tickers)} tickers."
+                )
+        except Exception as err:
+            print(f"Error in retraining thread: {err}", flush=True)
+
+    threading.Thread(target=run_retraining, daemon=True).start()
+    send_system_notifications(
+        f"⚠️ <b>EuroQuant Notification</b>\n"
+        f"ML model online retraining triggered by admin user: <b>{current_user['username']}</b>."
+    )
+    return {"status": "success", "message": "Retraining thread started successfully."}
+
+
+
+@app.get("/api/audit-log")
+def get_audit_log(
+    limit: int = 100,
+    action: Optional[str] = None,
+    current_user: dict = Depends(require_admin)
+):
+    """Admin only: returns recent audit log entries for compliance review."""
+    with engine.connect() as conn:
+        if action:
+            rows = conn.execute(
+                text("""
+                    SELECT id, username, action, details, ip_address, timestamp
+                    FROM audit_log
+                    WHERE action = :action
+                    ORDER BY timestamp DESC
+                    LIMIT :limit
+                """),
+                {"action": action, "limit": min(limit, 1000)}
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                text("""
+                    SELECT id, username, action, details, ip_address, timestamp
+                    FROM audit_log
+                    ORDER BY timestamp DESC
+                    LIMIT :limit
+                """),
+                {"limit": min(limit, 1000)}
+            ).fetchall()
+    return [
+        {
+            "id": r[0],
+            "username": r[1],
+            "action": r[2],
+            "details": r[3],
+            "ip_address": r[4],
+            "timestamp": r[5].isoformat() if r[5] else None
+        }
+        for r in rows
+    ]
+
+class OrderPayload(BaseModel):
+    id: str
+    account_id: str
+    ticker: str
+    action: str
+    status: str
+    requested_price: float
+    executed_price: float
+    slippage: Optional[float] = 0.0
+    commission: Optional[float] = 0.0
+
+@app.get("/api/orders")
+def get_orders():
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT id, account_id, ticker, action, status, requested_price, executed_price, slippage, commission, timestamp FROM orders ORDER BY timestamp DESC LIMIT 100")).fetchall()
+        return [
+            {
+                "id": r[0],
+                "account_id": r[1],
+                "ticker": r[2],
+                "action": r[3],
+                "status": r[4],
+                "requested_price": float(r[5]) if r[5] is not None else 0.0,
+                "executed_price": float(r[6]) if r[6] is not None else 0.0,
+                "slippage": float(r[7]) if r[7] is not None else 0.0,
+                "commission": float(r[8]) if r[8] is not None else 0.0,
+                "timestamp": r[9].isoformat() if r[9] else None
+            }
+            for r in rows
+        ]
+
+@app.post("/api/orders")
+def create_order(payload: OrderPayload):
+    with engine.connect() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO orders (id, account_id, ticker, action, status, requested_price, executed_price, slippage, commission)
+                VALUES (:id, :account_id, :ticker, :action, :status, :requested_price, :executed_price, :slippage, :commission)
+                ON CONFLICT (id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    executed_price = EXCLUDED.executed_price,
+                    slippage = EXCLUDED.slippage,
+                    commission = EXCLUDED.commission
+            """),
+            {
+                "id": payload.id,
+                "account_id": payload.account_id,
+                "ticker": payload.ticker,
+                "action": payload.action,
+                "status": payload.status,
+                "requested_price": payload.requested_price,
+                "executed_price": payload.executed_price,
+                "slippage": payload.slippage,
+                "commission": payload.commission
+            }
+        )
+        conn.commit()
+    return {"status": "success", "order_id": payload.id}
+
+@app.get("/api/health")
+def health_check():
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected", "timestamp": datetime.now(timezone.utc).isoformat()}
+    except Exception as e:
+        return {"status": "unhealthy", "database": str(e), "timestamp": datetime.now(timezone.utc).isoformat()}
+
+@app.get("/api/stock/{ticker}/summary")
+def get_stock_llm_summary(ticker: str):
+    OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://host.docker.internal:11434")
+    with engine.connect() as conn:
+        articles = conn.execute(text("""
+            SELECT a.title, a.sentiment_label, a.sentiment_score
+            FROM news_articles a
+            JOIN news_company_mappings m ON a.id = m.article_id
+            WHERE m.company_ticker = :ticker
+            ORDER BY a.published_date DESC
+            LIMIT 5
+        """), {"ticker": ticker}).fetchall()
+        
+        if not articles:
+            return {"summary": "Nessuna notizia recente disponibile per analizzare il sentiment di questo asset."}
+            
+        articles_text = "\n".join([f"- {a[0]} (Sentiment: {a[1]}, Score: {a[2]})" for a in articles])
+        
+        prompt = f"""Sei un analista finanziario istituzionale.
+Basandoti sulle seguenti notizie recenti per l'asset {ticker}:
+{articles_text}
+
+Fornisci una sintesi esplicativa del sentiment generale di massimo 3 righe in italiano. Sii estremamente sintetico, professionale e focalizzato sulle notizie reali. Non inserire commenti personali, markdown o link.
+"""
+        try:
+            import requests
+            url = f"{OLLAMA_HOST}/api/generate"
+            payload = {
+                "model": "qwen2.5:3b",
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.3,
+                    "num_predict": 120,
+                    "num_thread": 4
+                }
+            }
+            response = requests.post(url, json=payload, timeout=25)
+            if response.status_code != 200:
+                payload["model"] = "llama3"
+                response = requests.post(url, json=payload, timeout=30)
+                
+            if response.status_code == 200:
+                return {"summary": response.json().get("response", "").strip()}
+        except Exception as e:
+            print(f"Error calling Ollama for summary: {e}")
+            
+        return {"summary": "Impossibile contattare il modello locale Ollama per sintetizzare il sentiment."}
+
+@app.get("/api/market-correlation")
+def get_market_correlation():
+    # Predefined list of 12 major assets for multi-asset matrix
+    assets = ['BTC-USD', 'ETH-USD', 'XRP-USD', 'AAPL', 'TSLA', 'NVDA', 'ENI.MI', 'ENEL.MI', 'TTE.PA', 'MC.PA', 'SAP.DE', 'EURUSD=X']
+    
+    with engine.connect() as conn:
+        # Fetch last 60 days of prices for all these assets
+        rows = conn.execute(text("""
+            SELECT ticker, timestamp, close
+            FROM stock_prices
+            WHERE ticker IN :assets AND close IS NOT NULL
+            ORDER BY timestamp ASC
+        """), {"assets": tuple(assets)}).fetchall()
+        
+    # Organize data by date and ticker
+    data_by_ticker = {ticker: {} for ticker in assets}
+    all_dates = set()
+    
+    for ticker, ts, close in rows:
+        d_str = ts.strftime("%Y-%m-%d")
+        data_by_ticker[ticker][d_str] = float(close)
+        all_dates.add(d_str)
+        
+    sorted_dates = sorted(list(all_dates))
+    
+    # Calculate daily percentage changes for each ticker
+    returns_by_ticker = {ticker: [] for ticker in assets}
+    for ticker in assets:
+        prices = []
+        for d in sorted_dates:
+            val = data_by_ticker[ticker].get(d, None)
+            if val is None and prices:
+                val = prices[-1]
+            if val is not None:
+                prices.append(val)
+            else:
+                prices.append(0.0)
+                
+        daily_returns = []
+        for i in range(1, len(prices)):
+            prev = prices[i-1]
+            curr = prices[i]
+            if prev > 0:
+                daily_returns.append((curr - prev) / prev)
+            else:
+                daily_returns.append(0.0)
+        returns_by_ticker[ticker] = daily_returns
+        
+    # Calculate Pearson Correlation Matrix
+    def pearson_corr(x, y):
+        n = len(x)
+        if n == 0:
+            return 0.0
+        mean_x = sum(x) / n
+        mean_y = sum(y) / n
+        diff_x = [val - mean_x for val in x]
+        diff_y = [val - mean_y for val in y]
+        num = sum(dx * dy for dx, dy in zip(diff_x, diff_y))
+        den_x = sum(dx ** 2 for dx in diff_x)
+        den_y = sum(dy ** 2 for dy in diff_y)
+        if den_x == 0 or den_y == 0:
+            return 0.0
+        return num / ((den_x * den_y) ** 0.5)
+        
+    matrix = []
+    for t1 in assets:
+        row = []
+        for t2 in assets:
+            row.append(round(pearson_corr(returns_by_ticker[t1], returns_by_ticker[t2]), 3))
+        matrix.append(row)
+        
+    return {
+        "tickers": assets,
+        "matrix": matrix
+    }
+
+@app.get("/api/mt5/risk-analytics")
+def get_risk_analytics():
+    tickers = ['BTC-USD', 'ETH-USD', 'XRP-USD', 'AAPL', 'TSLA', 'NVDA', 'ENI.MI', 'ENEL.MI', 'TTE.PA', 'MC.PA']
+    
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT ticker, timestamp, close
+            FROM stock_prices
+            WHERE ticker IN :tickers AND close IS NOT NULL
+            ORDER BY timestamp ASC
+        """), {"tickers": tuple(tickers)}).fetchall()
+        
+    data_by_ticker = {ticker: {} for ticker in tickers}
+    all_dates = set()
+    for ticker, ts, close in rows:
+        d_str = ts.strftime("%Y-%m-%d")
+        data_by_ticker[ticker][d_str] = float(close)
+        all_dates.add(d_str)
+        
+    sorted_dates = sorted(list(all_dates))
+    if len(sorted_dates) < 2:
+        return {
+            "value_at_risk_95": 0.0,
+            "sharpe_ratio": 0.0,
+            "sortino_ratio": 0.0,
+            "max_drawdown": 0.0,
+            "equity_curve": []
+        }
+        
+    aligned_prices = []
+    for d in sorted_dates:
+        row_prices = []
+        for t in tickers:
+            val = data_by_ticker[t].get(d, None)
+            if val is None and aligned_prices:
+                val = aligned_prices[-1][tickers.index(t)]
+            row_prices.append(val if val is not None else 1.0)
+        aligned_prices.append(row_prices)
+        
+    equity = 100000.0
+    equity_curve = [{"date": sorted_dates[0], "equity": equity}]
+    daily_returns = []
+    
+    for i in range(1, len(aligned_prices)):
+        prev_row = aligned_prices[i-1]
+        curr_row = aligned_prices[i]
+        
+        day_return = 0.0
+        weight = 1.0 / len(tickers)
+        for j in range(len(tickers)):
+            prev_p = prev_row[j]
+            curr_p = curr_row[j]
+            if prev_p > 0:
+                day_return += weight * ((curr_p - prev_p) / prev_p)
+                
+        equity = equity * (1.0 + day_return)
+        equity_curve.append({"date": sorted_dates[i], "equity": round(equity, 2)})
+        daily_returns.append(day_return)
+        
+    mean_ret = sum(daily_returns) / len(daily_returns) if daily_returns else 0.0
+    var_ret = sum((r - mean_ret) ** 2 for r in daily_returns) / len(daily_returns) if len(daily_returns) > 1 else 0.0
+    std_ret = var_ret ** 0.5
+    
+    downside_returns = [r for r in daily_returns if r < 0]
+    downside_var = sum((r - mean_ret) ** 2 for r in downside_returns) / len(downside_returns) if downside_returns else 0.00001
+    downside_std = downside_var ** 0.5
+    
+    sharpe = round((mean_ret / std_ret * (252 ** 0.5)), 2) if std_ret > 0 else 0.0
+    sortino = round((mean_ret / downside_std * (252 ** 0.5)), 2) if downside_std > 0 else 0.0
+    
+    peak = 100000.0
+    max_dd = 0.0
+    for eq_item in equity_curve:
+        val = eq_item["equity"]
+        if val > peak:
+            peak = val
+        dd = (peak - val) / peak * 100.0
+        if dd > max_dd:
+            max_dd = dd
+            
+    sorted_returns = sorted(daily_returns)
+    var_idx = int(0.05 * len(sorted_returns))
+    var_95 = sorted_returns[var_idx] if sorted_returns else 0.0
+    
+    return {
+        "value_at_risk_95": round(abs(var_95) * 100.0, 2),
+        "sharpe_ratio": sharpe,
+        "sortino_ratio": sortino,
+        "max_drawdown": round(max_dd, 2),
+        "equity_curve": equity_curve
+    }
+
+@app.post("/api/backtest/portfolio", response_model=PortfolioBacktestResponse)
+def run_portfolio_backtest(req: PortfolioBacktestRequest):
+    if not req.tickers:
+        raise HTTPException(status_code=400, detail="Must provide at least one ticker.")
+        
+    with engine.connect() as conn:
+        prices_rows = conn.execute(text("""
+            SELECT ticker, timestamp, close, rsi
+            FROM stock_prices
+            WHERE ticker IN :tickers AND close IS NOT NULL
+            ORDER BY timestamp ASC
+        """), {"tickers": tuple(req.tickers)}).fetchall()
+        
+        sent_rows = conn.execute(text("""
+            SELECT m.company_ticker, a.published_date, a.sentiment_score
+            FROM news_articles a
+            JOIN news_company_mappings m ON a.id = m.article_id
+            WHERE m.company_ticker IN :tickers AND a.sentiment_score IS NOT NULL
+        """), {"tickers": tuple(req.tickers)}).fetchall()
+        
+    sent_by_ticker_date = {ticker: {} for ticker in req.tickers}
+    for tick, dt, score in sent_rows:
+        d_str = dt.strftime("%Y-%m-%d")
+        if d_str not in sent_by_ticker_date[tick]:
+            sent_by_ticker_date[tick][d_str] = []
+        sent_by_ticker_date[tick][d_str].append(float(score))
+        
+    avg_sent_by_ticker_date = {tick: {} for tick in req.tickers}
+    for tick in req.tickers:
+        for d, vals in sent_by_ticker_date[tick].items():
+            avg_sent_by_ticker_date[tick][d] = sum(vals)/len(vals)
+            
+    prices_by_date = {}
+    for ticker, ts, close, rsi in prices_rows:
+        d_str = ts.strftime("%Y-%m-%d")
+        if d_str not in prices_by_date:
+            prices_by_date[d_str] = {}
+        prices_by_date[d_str][ticker] = (float(close), float(rsi) if rsi else 50.0)
+        
+    sorted_dates = sorted(list(prices_by_date.keys()))
+    if not sorted_dates:
+        raise HTTPException(status_code=404, detail="No price data available for the backtest period.")
+        
+    cash = req.capital
+    positions = {}
+    equity_curve = []
+    
+    trades = 0
+    winning_trades = 0
+    peak_equity = req.capital
+    max_dd = 0.0
+    
+    max_pos = len(req.tickers)
+    allocation_per_pos = req.capital / max_pos
+    
+    for d in sorted_dates:
+        day_prices = prices_by_date[d]
+        
+        liquidated = []
+        for ticker, pos_info in list(positions.items()):
+            if ticker in day_prices:
+                close_val, rsi_val = day_prices[ticker]
+                sentiment_val = avg_sent_by_ticker_date[ticker].get(d, 0.0)
+                
+                if rsi_val >= req.sell_rsi or sentiment_val <= req.sell_sentiment:
+                    # Incorporate slippage (exit price is slightly lower) & commission (0.1%)
+                    executed_sell_price = close_val * 0.9995
+                    gross_cash = pos_info["units"] * executed_sell_price
+                    commission_cost = gross_cash * 0.001
+                    cash += gross_cash - commission_cost
+                    trades += 1
+                    if executed_sell_price > pos_info["entry_price"]:
+                        winning_trades += 1
+                    liquidated.append(ticker)
+                    
+        for t in liquidated:
+            positions.pop(t)
+            
+        for ticker in req.tickers:
+            if ticker not in positions and ticker in day_prices:
+                close_val, rsi_val = day_prices[ticker]
+                sentiment_val = avg_sent_by_ticker_date[ticker].get(d, 0.0)
+                
+                if (rsi_val <= req.buy_rsi or sentiment_val >= req.buy_sentiment) and cash >= allocation_per_pos:
+                    # Incorporate slippage (entry price is slightly higher) & commission (0.1%)
+                    executed_buy_price = close_val * 1.0005
+                    commission_cost = allocation_per_pos * 0.001
+                    net_cash = allocation_per_pos - commission_cost
+                    units = net_cash / executed_buy_price
+                    positions[ticker] = {"units": units, "entry_price": executed_buy_price}
+                    cash -= allocation_per_pos
+                    
+        current_eq = cash
+        for ticker, pos_info in positions.items():
+            if ticker in day_prices:
+                current_eq += pos_info["units"] * day_prices[ticker][0]
+            else:
+                current_eq += pos_info["units"] * pos_info["entry_price"]
+                
+        if current_eq > peak_equity:
+            peak_equity = current_eq
+        dd = (peak_equity - current_eq) / peak_equity * 100.0
+        if dd > max_dd:
+            max_dd = dd
+            
+        equity_curve.append({"date": d, "equity": round(current_eq, 2)})
+        
+    final_cap = current_eq
+    win_rate = (winning_trades / trades * 100.0) if trades > 0 else 0.0
+    tot_ret = ((final_cap - req.capital) / req.capital) * 100.0
+    
+    return PortfolioBacktestResponse(
+        initial_capital=req.capital,
+        final_capital=round(final_cap, 2),
+        total_return_percent=round(tot_ret, 2),
+        max_drawdown=round(max_dd, 2),
+        win_rate=round(win_rate, 2),
+        total_trades=trades,
+        equity_curve=equity_curve
+    )
+
+class OptimizePortfolioPayload(BaseModel):
+    tickers: List[str]
+    method: str = "max_sharpe"
+    use_black_litterman: bool = True
+    rf_rate: float = 0.0
+
+@app.post("/api/portfolio/optimize")
+def post_optimize_portfolio(payload: OptimizePortfolioPayload):
+    from portfolio_opt import optimize_portfolio
+    try:
+        with engine.connect() as db:
+            res = optimize_portfolio(
+                payload.tickers, 
+                db, 
+                method=payload.method, 
+                use_black_litterman=payload.use_black_litterman, 
+                rf=payload.rf_rate
+            )
+            return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/portfolio/monte-carlo")
+def get_portfolio_monte_carlo(capital: float = 10000.0, days: int = 30, runs: int = 1000):
+    try:
+        import numpy as np
+        import pandas as pd
+        from portfolio_opt import fetch_historical_returns
+        
+        with engine.connect() as db:
+            tickers_query = db.execute(text("SELECT ticker FROM companies WHERE sector NOT IN ('Index', 'Forex')")).fetchall()
+            tickers = [t[0] for t in tickers_query]
+            
+            returns_df = fetch_historical_returns(tickers, db, days=60)
+            
+        if returns_df.empty or returns_df.shape[1] < 2:
+            mu_d = 0.0005
+            sigma_d = 0.01
+        else:
+            port_returns = returns_df.mean(axis=1)
+            mu_d = float(port_returns.mean())
+            sigma_d = float(port_returns.std())
+            if np.isnan(mu_d) or mu_d is None:
+                mu_d = 0.0005
+            if np.isnan(sigma_d) or sigma_d is None or sigma_d == 0:
+                sigma_d = 0.01
+
+        sim_paths = np.zeros((runs, days + 1))
+        sim_paths[:, 0] = capital
+        
+        for t in range(1, days + 1):
+            shocks = np.random.normal(mu_d, sigma_d, runs)
+            sim_paths[:, t] = sim_paths[:, t - 1] * (1.0 + shocks)
+            
+        drawdowns = []
+        for i in range(runs):
+            path = sim_paths[i, :]
+            max_val = np.maximum.accumulate(path)
+            max_val[max_val == 0] = 1.0
+            dd = (max_val - path) / max_val * 100.0
+            drawdowns.append(np.max(dd))
+            
+        prob_dd_5 = float(np.sum(np.array(drawdowns) > 5.0) / runs * 100.0)
+        
+        paths_data = []
+        for t in range(days + 1):
+            vals = sim_paths[:, t]
+            paths_data.append({
+                "day": t,
+                "p5": float(np.percentile(vals, 5)),
+                "p50": float(np.percentile(vals, 50)),
+                "p95": float(np.percentile(vals, 95))
+            })
+            
+        final_returns = (sim_paths[:, -1] - capital) / capital
+        var_95 = float(-np.percentile(final_returns, 5) * 100.0)
+        
+        cutoff = np.percentile(final_returns, 5)
+        cvar_95 = float(-np.mean(final_returns[final_returns <= cutoff]) * 100.0)
+        
+        return {
+            "paths": paths_data,
+            "var_95": round(var_95, 2),
+            "cvar_95": round(cvar_95, 2),
+            "prob_drawdown_5": round(prob_dd_5, 2)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class OptimizeParamsPayload(BaseModel):
+    tickers: List[str]
+    capital: float = 10000.0
+
+@app.post("/api/backtest/optimize-params")
+def post_optimize_params(payload: OptimizeParamsPayload):
+    try:
+        import numpy as np
+        import pandas as pd
+        
+        with engine.connect() as conn:
+            prices_rows = conn.execute(text("""
+                SELECT ticker, timestamp, close, rsi
+                FROM stock_prices
+                WHERE ticker IN :tickers AND close IS NOT NULL
+                ORDER BY timestamp ASC
+            """), {"tickers": tuple(payload.tickers)}).fetchall()
+            
+            sent_rows = conn.execute(text("""
+                SELECT m.company_ticker, a.published_date, a.sentiment_score
+                FROM news_articles a
+                JOIN news_company_mappings m ON a.id = m.article_id
+                WHERE m.company_ticker IN :tickers AND a.sentiment_score IS NOT NULL
+            """), {"tickers": tuple(payload.tickers)}).fetchall()
+            
+        if not prices_rows:
+            return {"status": "no_data", "best_params": []}
+            
+        sent_by_ticker_date = {ticker: {} for ticker in payload.tickers}
+        for tick, dt, score in sent_rows:
+            d_str = dt.strftime("%Y-%m-%d")
+            if d_str not in sent_by_ticker_date[tick]:
+                sent_by_ticker_date[tick][d_str] = []
+            sent_by_ticker_date[tick][d_str].append(float(score))
+            
+        avg_sent_by_ticker_date = {tick: {} for tick in payload.tickers}
+        for tick in payload.tickers:
+            for d, vals in sent_by_ticker_date[tick].items():
+                avg_sent_by_ticker_date[tick][d] = sum(vals)/len(vals)
+                
+        prices_by_date = {}
+        for ticker, ts, close, rsi in prices_rows:
+            d_str = ts.strftime("%Y-%m-%d")
+            if d_str not in prices_by_date:
+                prices_by_date[d_str] = {}
+            prices_by_date[d_str][ticker] = (float(close), float(rsi) if rsi else 50.0)
+            
+        sorted_dates = sorted(list(prices_by_date.keys()))
+        if len(sorted_dates) < 5:
+            return {"status": "insufficient_data", "best_params": []}
+
+        buy_rsi_grid = [25, 30, 35]
+        sell_rsi_grid = [65, 70, 75]
+        buy_sent_grid = [0.1, 0.2, 0.3]
+        sell_sent_grid = [-0.3, -0.2, -0.1]
+        
+        results = []
+        
+        for brsi in buy_rsi_grid:
+            for srsi in sell_rsi_grid:
+                for bsent in buy_sent_grid:
+                    for ssent in sell_sent_grid:
+                        cash = payload.capital
+                        positions = {}
+                        peak_equity = payload.capital
+                        max_dd = 0.0
+                        trades = 0
+                        winning_trades = 0
+                        max_pos = len(payload.tickers)
+                        allocation_per_pos = payload.capital / max_pos if max_pos > 0 else 0.0
+                        daily_eq = []
+                        
+                        for d in sorted_dates:
+                            day_prices = prices_by_date[d]
+                            
+                            liquidated = []
+                            for ticker, pos_info in list(positions.items()):
+                                if ticker in day_prices:
+                                    close_val, rsi_val = day_prices[ticker]
+                                    sentiment_val = avg_sent_by_ticker_date[ticker].get(d, 0.0)
+                                    
+                                    if rsi_val >= srsi or sentiment_val <= ssent:
+                                        cash += pos_info["units"] * close_val
+                                        trades += 1
+                                        if close_val > pos_info["entry_price"]:
+                                            winning_trades += 1
+                                        liquidated.append(ticker)
+                            for t in liquidated:
+                                positions.pop(t)
+                                
+                            for ticker in payload.tickers:
+                                if ticker not in positions and ticker in day_prices:
+                                    close_val, rsi_val = day_prices[ticker]
+                                    sentiment_val = avg_sent_by_ticker_date[ticker].get(d, 0.0)
+                                    
+                                    if (rsi_val <= brsi or sentiment_val >= bsent) and cash >= allocation_per_pos:
+                                        units = allocation_per_pos / close_val
+                                        positions[ticker] = {"units": units, "entry_price": close_val}
+                                        cash -= allocation_per_pos
+                                        
+                            curr_eq = cash
+                            for ticker, pos_info in positions.items():
+                                if ticker in day_prices:
+                                    curr_eq += pos_info["units"] * day_prices[ticker][0]
+                                else:
+                                    curr_eq += pos_info["units"] * pos_info["entry_price"]
+                                    
+                            if curr_eq > peak_equity:
+                                peak_equity = curr_eq
+                            dd = (peak_equity - curr_eq) / peak_equity * 100.0
+                            if dd > max_dd:
+                                max_dd = dd
+                            daily_eq.append(curr_eq)
+                            
+                        eq_s = pd.Series(daily_eq)
+                        returns = eq_s.pct_change().dropna()
+                        std_ret = returns.std()
+                        if std_ret > 0:
+                            sharpe = float((returns.mean() / std_ret) * np.sqrt(252))
+                        else:
+                            sharpe = 0.0
+                            
+                        tot_ret = float(((curr_eq - payload.capital) / payload.capital) * 100.0)
+                        win_rate = (winning_trades / trades * 100.0) if trades > 0 else 0.0
+                        
+                        results.append({
+                            "buy_rsi": brsi,
+                            "sell_rsi": srsi,
+                            "buy_sentiment": bsent,
+                            "sell_sentiment": ssent,
+                            "total_return_percent": round(tot_ret, 2),
+                            "max_drawdown": round(max_dd, 2),
+                            "sharpe_ratio": round(sharpe, 2),
+                            "win_rate": round(win_rate, 2),
+                            "total_trades": trades
+                        })
+                        
+        results.sort(key=lambda x: x["sharpe_ratio"], reverse=True)
+        return {
+            "status": "success",
+            "best_params": results[:5]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 

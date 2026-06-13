@@ -1,10 +1,21 @@
 import json
+import logging
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from sqlalchemy import text
 from database import SessionLocal
 from config import OLLAMA_HOST, V2TX_THRESHOLD
 from nlp import calculate_decayed_sentiment
+from ml_engine import train_and_predict_direction
+
+# Structured JSON logger
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"time": "%(asctime)s", "level": "%(levelname)s", "msg": %(message)s}',
+    datefmt="%Y-%m-%dT%H:%M:%SZ"
+)
+log = logging.getLogger("recommender")
 
 def get_latest_price_metrics(ticker, db):
     """Retrieves the latest two stock price records for a ticker to calculate metrics."""
@@ -267,124 +278,185 @@ def generate_rule_based_fallback(ticker, company_name, metrics, sentiment, news,
         "reason_technical": reason_technical
     }
 
+def _process_single_company(comp, v2tx, db_url):
+    """
+    Processes a single company: fetches metrics, sentiment, news,
+    calls LLM, and saves the recommendation to the database.
+    Runs in a worker thread with its own DB session.
+    """
+    from database import SessionLocal as _SessionLocal
+    ticker, name = comp
+    db = _SessionLocal()
+    try:
+        # 1. Fetch latest price metrics & indicators
+        metrics = get_latest_price_metrics(ticker, db)
+        if not metrics or metrics["close"] is None:
+            log.warning(json.dumps({"ticker": ticker, "event": "skipped", "reason": "no price data"}))
+            return None
+
+        # 2. Fetch decayed sentiment
+        sentiment_score = calculate_decayed_sentiment(ticker, db)
+
+        # 3. Fetch recent news
+        news = get_top_news_for_company(ticker, db)
+
+        # 4. Generate LLM recommendation (with Gemini fallback + rule-based)
+        log.info(json.dumps({"ticker": ticker, "event": "llm_start"}))
+        rec_data = query_ollama_recommendation(ticker, name, metrics, sentiment_score, news, v2tx)
+
+        # 5. Risk Management: V2TX check
+        final_rating = rec_data["rating"]
+        macro_reason = rec_data["reason_macro"]
+
+        if v2tx > V2TX_THRESHOLD:
+            if final_rating in ["BUY", "STRONG BUY"]:
+                log.warning(json.dumps({"ticker": ticker, "event": "downgraded", "v2tx": v2tx, "from": final_rating}))
+                final_rating = "HOLD"
+            risk_msg = f"[RISCHIO SISTEMICO ELEVATO: VSTOXX a {v2tx:.2f} sopra la soglia di guardia di {V2TX_THRESHOLD}. Nuovi acquisti bloccati.] "
+            macro_reason = risk_msg + macro_reason
+
+        full_reason = f"Macro:\n{macro_reason}\n\nMicro:\n{rec_data['reason_micro']}\n\nTechnical:\n{rec_data['reason_technical']}"
+
+        # 6. Read previous signal for alert comparison
+        prev_row = db.execute(
+            text("SELECT signal FROM recommendations WHERE ticker = :ticker"),
+            {"ticker": ticker}
+        ).fetchone()
+        prev_signal = prev_row[0] if prev_row else None
+
+        # 7. Train ML model
+        try:
+            ml_prob = train_and_predict_direction(ticker, db)
+        except Exception as ml_err:
+            log.warning(json.dumps({"ticker": ticker, "event": "ml_failed", "error": str(ml_err)}))
+            ml_prob = 0.50
+
+        # 8. Persist to database
+        db.execute(
+            text("""
+                INSERT INTO recommendations (ticker, timestamp, signal, sentiment_score, price_change_24h,
+                    reason_macro, reason_micro, reason_technical, full_reason, adx, atr, volatility_lot_sizing, ml_prediction_prob)
+                VALUES (:ticker, :timestamp, :signal, :sentiment_score, :price_change_24h,
+                    :reason_macro, :reason_micro, :reason_technical, :full_reason, :adx, :atr, :volatility_lot_sizing, :ml_prediction_prob)
+                ON CONFLICT (ticker) DO UPDATE SET
+                    timestamp = EXCLUDED.timestamp,
+                    signal = EXCLUDED.signal,
+                    sentiment_score = EXCLUDED.sentiment_score,
+                    price_change_24h = EXCLUDED.price_change_24h,
+                    reason_macro = EXCLUDED.reason_macro,
+                    reason_micro = EXCLUDED.reason_micro,
+                    reason_technical = EXCLUDED.reason_technical,
+                    full_reason = EXCLUDED.full_reason,
+                    adx = EXCLUDED.adx,
+                    atr = EXCLUDED.atr,
+                    volatility_lot_sizing = EXCLUDED.volatility_lot_sizing,
+                    ml_prediction_prob = EXCLUDED.ml_prediction_prob
+            """),
+            {
+                "ticker": ticker, "timestamp": datetime.now(timezone.utc),
+                "signal": final_rating, "sentiment_score": sentiment_score,
+                "price_change_24h": metrics["price_change_24h"],
+                "reason_macro": macro_reason, "reason_micro": rec_data["reason_micro"],
+                "reason_technical": rec_data["reason_technical"], "full_reason": full_reason,
+                "adx": metrics["adx"], "atr": metrics["atr"],
+                "volatility_lot_sizing": metrics["volatility_lot_sizing"],
+                "ml_prediction_prob": ml_prob
+            }
+        )
+        db.execute(
+            text("""
+                INSERT INTO recommendation_history (ticker, timestamp, signal, sentiment_score,
+                    price_change_24h, reason_technical, adx, atr, volatility_lot_sizing)
+                VALUES (:ticker, :timestamp, :signal, :sentiment_score, :price_change_24h,
+                    :reason_technical, :adx, :atr, :volatility_lot_sizing)
+            """),
+            {
+                "ticker": ticker, "timestamp": datetime.now(timezone.utc),
+                "signal": final_rating, "sentiment_score": sentiment_score,
+                "price_change_24h": metrics["price_change_24h"],
+                "reason_technical": rec_data["reason_technical"],
+                "adx": metrics["adx"], "atr": metrics["atr"],
+                "volatility_lot_sizing": metrics["volatility_lot_sizing"]
+            }
+        )
+        db.commit()
+
+        # 9. Send alerts if signal changed
+        if prev_signal != final_rating:
+            try:
+                settings_row = db.execute(
+                    text("SELECT telegram_bot_token, telegram_chat_id, discord_webhook_url FROM system_settings WHERE id = 1")
+                ).fetchone()
+                if settings_row:
+                    from crypto_utils import decrypt_data
+                    tg_token = decrypt_data(settings_row[0])
+                    tg_chat = decrypt_data(settings_row[1])
+                    discord_url = decrypt_data(settings_row[2])
+                    msg = (f"🚨 **EuroQuant Alert: Cambio Segnale per {ticker}**\n"
+                           f"- Da: `{prev_signal or 'N/A'}`\n- A: `{final_rating}`\n"
+                           f"- Analisi Tecnica: {rec_data['reason_technical']}")
+                    if tg_token and tg_chat:
+                        try:
+                            requests.post(
+                                f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                                json={"chat_id": tg_chat, "text": msg, "parse_mode": "Markdown"},
+                                timeout=10
+                            )
+                        except Exception as tg_err:
+                            log.warning(json.dumps({"event": "telegram_error", "error": str(tg_err)}))
+                    if discord_url:
+                        try:
+                            requests.post(discord_url, json={"content": msg}, timeout=10)
+                        except Exception as disc_err:
+                            log.warning(json.dumps({"event": "discord_error", "error": str(disc_err)}))
+            except Exception as alert_err:
+                log.warning(json.dumps({"event": "alert_system_error", "error": str(alert_err)}))
+
+        log.info(json.dumps({"ticker": ticker, "event": "signal_generated", "signal": final_rating}))
+        return ticker
+    except Exception as e:
+        log.error(json.dumps({"ticker": ticker, "event": "error", "error": str(e)}))
+        db.rollback()
+        return None
+    finally:
+        db.close()
+
+
 def generate_recommendations():
     """
     Scans all companies, calculates sentiment, reads prices/volatility,
-    runs risk checks, and generates explainable AI recommendations.
+    runs risk checks, and generates explainable AI recommendations
+    using parallelized LLM calls (all tickers receive real AI analysis).
     """
     db = SessionLocal()
     try:
         # Get active companies (excluding Indices)
-        result = db.execute(text("SELECT ticker, name FROM companies WHERE sector != 'Index'"))
+        result = db.execute(text("SELECT ticker, name FROM companies WHERE sector NOT IN ('Index', 'Forex')"))
         companies = result.fetchall()
-        
         v2tx = get_latest_v2tx_from_db(db)
-        print(f"Decision Engine: Starting recommendations. VSTOXX (V2TX) is at {v2tx:.2f}")
-        
-        updated_count = 0
-        llm_calls_made = 0
-        max_llm_calls = 3 # Cap LLM calls to prevent slow processing times
-        
-        for comp in companies:
-            ticker, name = comp
-            
-            try:
-                # 1. Fetch latest price metrics & indicators
-                metrics = get_latest_price_metrics(ticker, db)
-                if not metrics or metrics["close"] is None:
-                    print(f"Skipping {ticker}: no price data available.")
-                    continue
-                    
-                # 2. Fetch decayed sentiment
-                sentiment_score = calculate_decayed_sentiment(ticker, db)
-                
-                # 3. Fetch recent news
-                news = get_top_news_for_company(ticker, db)
-                
-                # 4. Generate recommendation (hybrid LLM/Quant fallback)
-                if llm_calls_made < max_llm_calls:
-                    print(f"Running LLM analysis for {ticker} ({name})...")
-                    rec_data = query_ollama_recommendation(ticker, name, metrics, sentiment_score, news, v2tx)
-                    llm_calls_made += 1
-                else:
-                    rec_data = generate_rule_based_fallback(ticker, name, metrics, sentiment_score, news, v2tx)
-                
-                # 5. Risk Management Rule: Check V2TX Volatility
-                final_rating = rec_data["rating"]
-                macro_reason = rec_data["reason_macro"]
-                
-                if v2tx > V2TX_THRESHOLD:
-                    if final_rating in ["BUY", "STRONG BUY"]:
-                        print(f"RISK WARNING: Downgrading {ticker} from {final_rating} to HOLD due to VSTOXX ({v2tx:.2f}) exceeding threshold ({V2TX_THRESHOLD}).")
-                        final_rating = "HOLD"
-                        
-                    # Inject systemic risk warning into the macro reason
-                    risk_msg = f"[RISCHIO SISTEMICO ELEVATO: VSTOXX a {v2tx:.2f} sopra la soglia di guardia di {V2TX_THRESHOLD}. Nuovi acquisti bloccati.] "
-                    macro_reason = risk_msg + macro_reason
-                
-                full_reason = f"Macro:\n{macro_reason}\n\nMicro:\n{rec_data['reason_micro']}\n\nTechnical:\n{rec_data['reason_technical']}"
-                
-                # Save to database
-                db.execute(
-                    text("""
-                        INSERT INTO recommendations (ticker, timestamp, signal, sentiment_score, price_change_24h, reason_macro, reason_micro, reason_technical, full_reason, adx, atr, volatility_lot_sizing)
-                        VALUES (:ticker, :timestamp, :signal, :sentiment_score, :price_change_24h, :reason_macro, :reason_micro, :reason_technical, :full_reason, :adx, :atr, :volatility_lot_sizing)
-                        ON CONFLICT (ticker) DO UPDATE SET
-                            timestamp = EXCLUDED.timestamp,
-                            signal = EXCLUDED.signal,
-                            sentiment_score = EXCLUDED.sentiment_score,
-                            price_change_24h = EXCLUDED.price_change_24h,
-                            reason_macro = EXCLUDED.reason_macro,
-                            reason_micro = EXCLUDED.reason_micro,
-                            reason_technical = EXCLUDED.reason_technical,
-                            full_reason = EXCLUDED.full_reason,
-                            adx = EXCLUDED.adx,
-                            atr = EXCLUDED.atr,
-                            volatility_lot_sizing = EXCLUDED.volatility_lot_sizing
-                    """),
-                    {
-                        "ticker": ticker,
-                        "timestamp": datetime.now(timezone.utc),
-                        "signal": final_rating,
-                        "sentiment_score": sentiment_score,
-                        "price_change_24h": metrics["price_change_24h"],
-                        "reason_macro": macro_reason,
-                        "reason_micro": rec_data["reason_micro"],
-                        "reason_technical": rec_data["reason_technical"],
-                        "full_reason": full_reason,
-                        "adx": metrics["adx"],
-                        "atr": metrics["atr"],
-                        "volatility_lot_sizing": metrics["volatility_lot_sizing"]
-                    }
-                )
-                db.execute(
-                    text("""
-                        INSERT INTO recommendation_history (ticker, timestamp, signal, sentiment_score, price_change_24h, reason_technical, adx, atr, volatility_lot_sizing)
-                        VALUES (:ticker, :timestamp, :signal, :sentiment_score, :price_change_24h, :reason_technical, :adx, :atr, :volatility_lot_sizing)
-                    """),
-                    {
-                        "ticker": ticker,
-                        "timestamp": datetime.now(timezone.utc),
-                        "signal": final_rating,
-                        "sentiment_score": sentiment_score,
-                        "price_change_24h": metrics["price_change_24h"],
-                        "reason_technical": rec_data["reason_technical"],
-                        "adx": metrics["adx"],
-                        "atr": metrics["atr"],
-                        "volatility_lot_sizing": metrics["volatility_lot_sizing"]
-                    }
-                )
-                db.commit()
-                updated_count += 1
-                print(f"Generated signal {final_rating} for {ticker}")
-            except Exception as e:
-                print(f"Error generating recommendation for {ticker}: {e}")
-                db.rollback()
-                
-        print(f"Decision Engine: Completed {updated_count} recommendations. LLM calls: {llm_calls_made}")
-        return updated_count
     finally:
         db.close()
+
+    log.info(json.dumps({"event": "engine_start", "v2tx": round(v2tx, 2), "companies": len(companies)}))
+
+    updated_count = 0
+    # Parallelize LLM calls — max 4 concurrent to avoid overwhelming Ollama/Gemini
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(_process_single_company, comp, v2tx, None): comp[0]
+            for comp in companies
+        }
+        for future in as_completed(futures):
+            ticker = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    updated_count += 1
+            except Exception as exc:
+                log.error(json.dumps({"ticker": ticker, "event": "future_error", "error": str(exc)}))
+
+    log.info(json.dumps({"event": "engine_complete", "updated": updated_count, "total": len(companies)}))
+    return updated_count
 
 if __name__ == "__main__":
     generate_recommendations()

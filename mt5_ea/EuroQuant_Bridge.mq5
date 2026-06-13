@@ -19,7 +19,17 @@ input string   InpTickerName        = "";                                      /
 input int      InpCheckIntervalSecs = 60;                                      // Frequenza controllo API (in secondi)
 
 input group "=== RISK & POSITION MANAGEMENT ==="
-input double   InpLotMultiplier     = 1.0;                                     // Quota/Moltiplicatore rispetto al lotto minimo
+enum ENUM_SIZING_MODE {
+   SIZING_MIN_LOT_MULTIPLIER = 0, // Moltiplicatore del Lotto Minimo (Default)
+   SIZING_RISK_PERCENT = 1,       // % Rischio sul Capitale per trade (Richiede Stop Loss)
+   SIZING_MARGIN_PERCENT = 2      // % Margine sul Capitale per trade
+};
+input ENUM_SIZING_MODE InpSizingMode        = SIZING_MIN_LOT_MULTIPLIER;               // Modalità Calcolo Lotto
+input double   InpLotMultiplier     = 1.0;                                     // Quota/Moltiplicatore rispetto al lotto minimo (se Modalità = Lotto Minimo)
+input double   InpRiskPercent       = 1.0;                                     // % di Rischio sul Capitale per operazione (se Modalità = Risk %)
+input double   InpMarginPercent     = 5.0;                                     // % di Margine sul Capitale per operazione (se Modalità = Margine %)
+input bool     InpEnablePartialClose = true;                                   // Abilita Chiusura Parziale (TP1) & Break-Even
+input double   InpPartialCloseAtrMultiplier = 1.5;                             // Moltiplicatore ATR per target TP1 (parziale)
 input ulong    InpMagicNumber       = 20260610;                                // Magic Number per identificare le posizioni
 input int      InpMaxSpreadPoints   = 50;                                      // Spread massimo consentito in punti (se InpMaxSpreadPercent <= 0)
 input double   InpMaxSpreadPercent  = 0.25;                                    // Spread massimo consentito in % del prezzo (0 per disabilitare)
@@ -347,6 +357,38 @@ void ManagePositions(string trade_symbol, string action, double sl, double tp, d
                Print("[EuroQuant Bridge] Chiusa posizione BUY precedente su ", trade_symbol, " su segnale ", action, ".");
                has_buy = false;
             }
+            else if(InpEnablePartialClose)
+            {
+               double pos_open = PositionGetDouble(POSITION_PRICE_OPEN);
+               double pos_sl = PositionGetDouble(POSITION_PRICE_SL);
+               double pos_vol = PositionGetDouble(POSITION_VOLUME);
+               double current_bid = SymbolInfoDouble(trade_symbol, SYMBOL_BID);
+               double sl_dist = (pos_sl > 0) ? MathAbs(pos_open - pos_sl) : MathAbs(pos_open - sl);
+               
+               if(sl_dist > 0 && pos_sl < pos_open)
+               {
+                  double tp1_price = pos_open + InpPartialCloseAtrMultiplier * sl_dist;
+                  if(current_bid >= tp1_price)
+                  {
+                     double min_lot = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_MIN);
+                     double lot_step = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_STEP);
+                     double close_vol = pos_vol / 2.0;
+                     if(lot_step > 0)
+                        close_vol = MathRound(close_vol / lot_step) * lot_step;
+                     if(close_vol < min_lot) close_vol = min_lot;
+                     
+                     if(close_vol < pos_vol)
+                     {
+                        if(trade.PositionClose(ticket, close_vol))
+                        {
+                           Print("[EuroQuant Bridge] TP1 Raggiunto su BUY ", trade_symbol, ". Chiusura parziale di ", DoubleToString(close_vol, 2), " lotti.");
+                           double current_tp = PositionGetDouble(POSITION_TP);
+                           trade.PositionModify(ticket, pos_open, current_tp);
+                        }
+                     }
+                  }
+               }
+            }
          }
          else if(pos_type == POSITION_TYPE_SELL)
          {
@@ -358,6 +400,38 @@ void ManagePositions(string trade_symbol, string action, double sl, double tp, d
                Print("[EuroQuant Bridge] Chiusa posizione SELL precedente su ", trade_symbol, " su segnale ", action, ".");
                has_sell = false;
             }
+            else if(InpEnablePartialClose)
+            {
+               double pos_open = PositionGetDouble(POSITION_PRICE_OPEN);
+               double pos_sl = PositionGetDouble(POSITION_PRICE_SL);
+               double pos_vol = PositionGetDouble(POSITION_VOLUME);
+               double current_ask = SymbolInfoDouble(trade_symbol, SYMBOL_ASK);
+               double sl_dist = (pos_sl > 0) ? MathAbs(pos_open - pos_sl) : MathAbs(pos_open - sl);
+               
+               if(sl_dist > 0 && (pos_sl > pos_open || pos_sl == 0))
+               {
+                  double tp1_price = pos_open - InpPartialCloseAtrMultiplier * sl_dist;
+                  if(current_ask <= tp1_price)
+                  {
+                     double min_lot = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_MIN);
+                     double lot_step = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_STEP);
+                     double close_vol = pos_vol / 2.0;
+                     if(lot_step > 0)
+                        close_vol = MathRound(close_vol / lot_step) * lot_step;
+                     if(close_vol < min_lot) close_vol = min_lot;
+                     
+                     if(close_vol < pos_vol)
+                     {
+                        if(trade.PositionClose(ticket, close_vol))
+                        {
+                           Print("[EuroQuant Bridge] TP1 Raggiunto su SELL ", trade_symbol, ". Chiusura parziale di ", DoubleToString(close_vol, 2), " lotti.");
+                           double current_tp = PositionGetDouble(POSITION_TP);
+                           trade.PositionModify(ticket, pos_open, current_tp);
+                        }
+                     }
+                  }
+               }
+            }
          }
       }
    }
@@ -368,22 +442,68 @@ void ManagePositions(string trade_symbol, string action, double sl, double tp, d
    }
 
    
-   // Calculate dynamic lot size based on broker limits and user multiplier
-   double min_lot = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_MIN);
-   double max_lot = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_MAX);
-   double lot_step = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_STEP);
-   
-   double trade_lot = min_lot * InpLotMultiplier * volatility_lot_sizing;
-   
-   // Normalize to broker volume step
-   if(lot_step > 0)
-   {
-      trade_lot = MathRound(trade_lot / lot_step) * lot_step;
-   }
-   
-   // Apply bounds checks
-   if(trade_lot < min_lot) trade_lot = min_lot;
-   if(trade_lot > max_lot) trade_lot = max_lot;
+    // Calculate lot size dynamically based on selected sizing mode
+    double min_lot = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_MIN);
+    double max_lot = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_MAX);
+    double lot_step = SymbolInfoDouble(trade_symbol, SYMBOL_VOLUME_STEP);
+    
+    if(min_lot <= 0) return;
+    
+    double trade_lot = min_lot;
+    
+    if(InpSizingMode == SIZING_MIN_LOT_MULTIPLIER)
+    {
+       trade_lot = min_lot * InpLotMultiplier * volatility_lot_sizing;
+    }
+    else if(InpSizingMode == SIZING_RISK_PERCENT)
+    {
+       double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+       double risk_amount = balance * (InpRiskPercent / 100.0);
+       double sl_distance = MathAbs(((action == "BUY") ? SymbolInfoDouble(trade_symbol, SYMBOL_ASK) : SymbolInfoDouble(trade_symbol, SYMBOL_BID)) - sl);
+       
+       if(sl_distance > 0)
+       {
+          double tick_value = SymbolInfoDouble(trade_symbol, SYMBOL_TRADE_TICK_VALUE);
+          double tick_size = SymbolInfoDouble(trade_symbol, SYMBOL_TRADE_TICK_SIZE);
+          if(tick_size > 0 && tick_value > 0)
+          {
+             double sl_distance_ticks = sl_distance / tick_size;
+             trade_lot = (risk_amount / (sl_distance_ticks * tick_value)) * volatility_lot_sizing;
+          }
+       }
+       else
+       {
+          trade_lot = min_lot * InpLotMultiplier * volatility_lot_sizing;
+       }
+    }
+    else if(InpSizingMode == SIZING_MARGIN_PERCENT)
+    {
+       double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+       double target_margin = balance * (InpMarginPercent / 100.0);
+       double margin_one_lot = 0.0;
+       
+       ENUM_ORDER_TYPE order_type = (action == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+       double check_price = (action == "BUY") ? SymbolInfoDouble(trade_symbol, SYMBOL_ASK) : SymbolInfoDouble(trade_symbol, SYMBOL_BID);
+       
+       if(check_price > 0 && OrderCalcMargin(order_type, trade_symbol, 1.0, check_price, margin_one_lot) && margin_one_lot > 0)
+       {
+          trade_lot = (target_margin / margin_one_lot) * volatility_lot_sizing;
+       }
+       else
+       {
+          trade_lot = min_lot * InpLotMultiplier * volatility_lot_sizing;
+       }
+    }
+    
+    // Normalize to broker volume step
+    if(lot_step > 0)
+    {
+       trade_lot = MathRound(trade_lot / lot_step) * lot_step;
+    }
+    
+    // Apply bounds checks
+    if(trade_lot < min_lot) trade_lot = min_lot;
+    if(trade_lot > max_lot) trade_lot = max_lot;
    
    double point = SymbolInfoDouble(trade_symbol, SYMBOL_POINT);
    

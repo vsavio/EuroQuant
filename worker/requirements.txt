@@ -9,3 +9,7 @@ psycopg2-binary==2.9.9
 requests==2.32.3
 transformers==4.41.2
 torch==2.3.1+cpu
+scipy
+scikit-learn
+cryptography==42.0.5
+tenacity==8.3.0

@@ -50,6 +50,7 @@ interface ScreenerRow {
   sentiment_score: number;
   signal: string;
   timestamp: string;
+  ml_prediction_prob?: number;
 }
 
 interface NewsArticle {
@@ -85,6 +86,7 @@ interface StockDetail {
   mt5_symbol: string;
   stop_loss: number;
   take_profit: number;
+  ml_prediction_prob?: number;
 }
 
 interface BrokerAccount {
@@ -99,8 +101,139 @@ interface BrokerAccount {
   last_seen: string | null;
 }
 
+let originalFetchRef: any = null;
+if (typeof window !== "undefined") {
+  originalFetchRef = window.fetch;
+  window.fetch = async (input, init) => {
+    const token = localStorage.getItem("euroquant_token");
+    if (token) {
+      init = init || {};
+      init.headers = init.headers || {};
+      if (init.headers instanceof Headers) {
+        init.headers.set("Authorization", `Bearer ${token}`);
+      } else if (Array.isArray(init.headers)) {
+        init.headers.push(["Authorization", `Bearer ${token}`]);
+      } else {
+        (init.headers as any)["Authorization"] = `Bearer ${token}`;
+      }
+    }
+    const response = await originalFetchRef(input, init);
+    if (response.status === 401) {
+      localStorage.removeItem("euroquant_token");
+      window.dispatchEvent(new Event("auth_failed"));
+    }
+    return response;
+  };
+}
+
+interface LoginScreenProps {
+  onLogin: () => void;
+  API_URL: string;
+}
+
+function LoginScreen({ onLogin, API_URL }: LoginScreenProps) {
+  const [username, setUsername] = useState("admin");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [isRegistering, setIsRegistering] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setLoading(true);
+
+    try {
+      const endpoint = isRegistering ? "/api/auth/register" : "/api/auth/login";
+      const res = await originalFetchRef(`${API_URL}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.detail || "Authentication failed");
+      }
+
+      const data = await res.json();
+      localStorage.setItem("euroquant_token", data.access_token);
+      onLogin();
+    } catch (err: any) {
+      setError(err.message || "An error occurred");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-[#06090e] text-[#e1e4e8] flex items-center justify-center p-4 relative overflow-hidden font-mono">
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_30%_30%,#1e2d42_0%,transparent_50%)] pointer-events-none" />
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_70%_70%,#122336_0%,transparent_50%)] pointer-events-none" />
+      <div className="max-w-md w-full border border-[#30363d] bg-[#0d1117]/85 backdrop-blur-md rounded-lg shadow-2xl p-8 relative z-10">
+        <div className="flex items-center gap-3 mb-6 justify-center">
+          <div className="w-12 h-12 bg-[#00ff66] text-black flex items-center justify-center font-bold text-2xl rounded">
+            EQ
+          </div>
+          <div>
+            <h1 className="text-[#00ff66] font-black tracking-wider text-2xl">🏛️ EUROQUANT</h1>
+            <p className="text-xs text-[#8b949e]">INSTITUTIONAL QUANT SYSTEM</p>
+          </div>
+        </div>
+        
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-xs uppercase tracking-wider text-[#8b949e] mb-1">Username</label>
+            <input 
+              type="text" 
+              value={username} 
+              onChange={(e) => setUsername(e.target.value)}
+              className="w-full bg-[#161b22] border border-[#30363d] focus:border-[#00ff66] focus:outline-none rounded px-3 py-2 text-sm text-[#e1e4e8]"
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-xs uppercase tracking-wider text-[#8b949e] mb-1">Password</label>
+            <input 
+              type="password" 
+              value={password} 
+              onChange={(e) => setPassword(e.target.value)}
+              className="w-full bg-[#161b22] border border-[#30363d] focus:border-[#00ff66] focus:outline-none rounded px-3 py-2 text-sm text-[#e1e4e8]"
+              required
+            />
+          </div>
+          
+          {error && (
+            <div className="border border-red-500/50 bg-red-900/20 text-red-400 text-xs p-3 rounded flex items-center gap-2">
+              ⚠️ {error}
+            </div>
+          )}
+          
+          <button 
+            type="submit" 
+            disabled={loading}
+            className="w-full bg-[#00ff66] hover:bg-[#00e55c] transition-colors disabled:opacity-50 text-black font-bold py-2 rounded text-sm uppercase tracking-wider"
+          >
+            {loading ? "AUTHENTICATING..." : isRegistering ? "Register Account" : "Access System"}
+          </button>
+        </form>
+
+        <div className="mt-6 text-center text-xs">
+          <button 
+            onClick={() => setIsRegistering(!isRegistering)}
+            className="text-[#8b949e] hover:text-[#00ff66] underline transition-colors"
+          >
+            {isRegistering ? "Already have an account? Log in" : "Create new Trader credentials"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function TerminalDashboard() {
   // States
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [marketSummary, setMarketSummary] = useState<MarketSummary | null>(null);
   const [screener, setScreener] = useState<ScreenerRow[]>([]);
   const [news, setNews] = useState<NewsArticle[]>([]);
@@ -121,6 +254,9 @@ export default function TerminalDashboard() {
   const [backtestSellSent, setBacktestSellSent] = useState(-0.1);
   const [backtestResults, setBacktestResults] = useState<any | null>(null);
   const [backtestLoading, setBacktestLoading] = useState(false);
+  const [optimizationLoading, setOptimizationLoading] = useState(false);
+  const [optimizationResults, setOptimizationResults] = useState<any>(null);
+  const [riskAccounts, setRiskAccounts] = useState<any[]>([]);
   const [activeOverrides, setActiveOverrides] = useState<Record<string, any>>({});
   const [signalHistory, setSignalHistory] = useState<any[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -137,6 +273,38 @@ export default function TerminalDashboard() {
   const [showRiskModal, setShowRiskModal] = useState(false);
   const [riskModalValue, setRiskModalValue] = useState("5.0");
 
+  // Advanced components states
+  const [mainTab, setMainTab] = useState<"dashboard" | "risk_telemetry" | "correlation" | "backtest" | "audit_log" | "ai_ml">("dashboard");
+  const [correlationData, setCorrelationData] = useState<{ tickers: string[]; matrix: number[][] } | null>(null);
+  const [riskAnalytics, setRiskAnalytics] = useState<{ value_at_risk_95: number; sharpe_ratio: number; sortino_ratio: number; max_drawdown: number; equity_curve: any[] } | null>(null);
+  const [portfolioBacktestResults, setPortfolioBacktestResults] = useState<any | null>(null);
+  const [portfolioBacktestLoading, setPortfolioBacktestLoading] = useState(false);
+  const [selectedPortfolioTickers, setSelectedPortfolioTickers] = useState<string[]>([]);
+  const [telegramBotToken, setTelegramBotToken] = useState("");
+  
+  // Compliance Audit & ML States
+  const [auditLogs, setAuditLogs] = useState<any[]>([]);
+  const [auditLogsLoading, setAuditLogsLoading] = useState(false);
+  const [mlMetrics, setMlMetrics] = useState<any[]>([]);
+  const [mlMetricsLoading, setMlMetricsLoading] = useState(false);
+  const [mlRetraining, setMlRetraining] = useState(false);
+
+  // MVO, WFO, and Monte Carlo States
+  const [monteCarloResults, setMonteCarloResults] = useState<any | null>(null);
+  const [monteCarloLoading, setMonteCarloLoading] = useState(false);
+  const [portfolioWeights, setPortfolioWeights] = useState<Record<string, number> | null>(null);
+  const [portfolioWeightsLoading, setPortfolioWeightsLoading] = useState(false);
+  const [optMethod, setOptMethod] = useState<"max_sharpe" | "min_volatility">("max_sharpe");
+  const [useBL, setUseBL] = useState(true);
+  const [wfoResults, setWfoResults] = useState<any[]>([]);
+  const [wfoLoading, setWfoLoading] = useState(false);
+  const [telegramChatId, setTelegramChatId] = useState("");
+  const [discordWebhookUrl, setDiscordWebhookUrl] = useState("");
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [llmSummary, setLlmSummary] = useState("");
+  const [llmSummaryLoading, setLlmSummaryLoading] = useState(false);
+  const [backtestCapital, setBacktestCapital] = useState(10000);
+
   useEffect(() => {
     const updateTime = () => {
       const now = new Date();
@@ -148,6 +316,18 @@ export default function TerminalDashboard() {
     updateTime();
     const interval = setInterval(updateTime, 1000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const token = localStorage.getItem("euroquant_token");
+    if (token) {
+      setIsAuthenticated(true);
+    }
+    const handleAuthFailed = () => {
+      setIsAuthenticated(false);
+    };
+    window.addEventListener("auth_failed", handleAuthFailed);
+    return () => window.removeEventListener("auth_failed", handleAuthFailed);
   }, []);
 
   const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -212,13 +392,97 @@ export default function TerminalDashboard() {
         setEmergencyKillSwitch(data.emergency_kill_switch);
         setCurrentDrawdownPercent(data.current_drawdown_percent);
         setRiskModalValue(String(data.max_drawdown_percent));
+        if (data.accounts) {
+          setRiskAccounts(data.accounts);
+        }
+      }
+
+      // Fetch system settings
+      const settingsRes = await fetch(`${API_URL}/api/system-settings`);
+      if (settingsRes.ok) {
+        const data = await settingsRes.json();
+        setTelegramBotToken(data.telegram_bot_token || "");
+        setTelegramChatId(data.telegram_chat_id || "");
+        setDiscordWebhookUrl(data.discord_webhook_url || "");
+      }
+
+      // Fetch market correlation
+      const correlationRes = await fetch(`${API_URL}/api/market-correlation`);
+      if (correlationRes.ok) {
+        const data = await correlationRes.json();
+        setCorrelationData(data);
+      }
+
+      // Fetch risk analytics
+      const riskAnalyticsRes = await fetch(`${API_URL}/api/mt5/risk-analytics`);
+      if (riskAnalyticsRes.ok) {
+        const data = await riskAnalyticsRes.json();
+        setRiskAnalytics(data);
       }
     } catch (error) {
       console.error("Error fetching dashboard data:", error);
     }
   };
 
+  const fetchAuditLogs = async () => {
+    setAuditLogsLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/api/audit-log?limit=200`);
+      if (res.ok) {
+        const data = await res.json();
+        setAuditLogs(data);
+      }
+    } catch (err) {
+      console.error("Error fetching audit logs:", err);
+    } finally {
+      setAuditLogsLoading(false);
+    }
+  };
+
+  const fetchMlMetrics = async () => {
+    setMlMetricsLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/api/ml/metrics`);
+      if (res.ok) {
+        const data = await res.json();
+        setMlMetrics(data);
+      }
+    } catch (err) {
+      console.error("Error fetching ML metrics:", err);
+    } finally {
+      setMlMetricsLoading(false);
+    }
+  };
+
+  const triggerMlRetrain = async () => {
+    setMlRetraining(true);
+    try {
+      const res = await fetch(`${API_URL}/api/ml/retrain`, { method: "POST" });
+      if (res.ok) {
+        alert("Retrain dei modelli ML avviato in background con successo!");
+        setTimeout(fetchMlMetrics, 2000);
+      } else {
+        alert("Errore durante l'avvio del retrain dei modelli.");
+      }
+    } catch (err) {
+      console.error("Error triggering ML retrain:", err);
+      alert("Errore di rete durante l'avvio del retrain.");
+    } finally {
+      setMlRetraining(false);
+    }
+  };
+
   useEffect(() => {
+    if (!isAuthenticated) return;
+    if (mainTab === "audit_log") {
+      fetchAuditLogs();
+    } else if (mainTab === "ai_ml") {
+      fetchMlMetrics();
+    }
+  }, [mainTab, isAuthenticated]);
+
+  useEffect(() => {
+    if (!isAuthenticated) return;
     fetchData();
     const interval = setInterval(fetchData, 60000);
     
@@ -256,10 +520,33 @@ export default function TerminalDashboard() {
       eventSource.close();
       ws.close();
     };
-  }, []);
+  }, [isAuthenticated]);
+
+  // Fetch Monte Carlo simulations on tab shift
+  useEffect(() => {
+    if (!isAuthenticated || mainTab !== "risk_telemetry") return;
+    if (mainTab === "risk_telemetry") {
+      const fetchMonteCarlo = async () => {
+        setMonteCarloLoading(true);
+        try {
+          const res = await fetch(`${API_URL}/api/portfolio/monte-carlo`);
+          if (res.ok) {
+            const data = await res.json();
+            setMonteCarloResults(data);
+          }
+        } catch (err) {
+          console.error("Monte Carlo error:", err);
+        } finally {
+          setMonteCarloLoading(false);
+        }
+      };
+      fetchMonteCarlo();
+    }
+  }, [mainTab]);
 
   // Fetch stock details when ticker is selected
   useEffect(() => {
+    if (!isAuthenticated) return;
     setBacktestResults(null);
     setChartTab("price");
     if (!selectedTicker) {
@@ -300,8 +587,25 @@ export default function TerminalDashboard() {
       }
     };
 
+    const fetchLlmSummary = async () => {
+      setLlmSummary("");
+      setLlmSummaryLoading(true);
+      try {
+        const res = await fetch(`${API_URL}/api/stock/${selectedTicker}/summary`);
+        if (res.ok) {
+          const data = await res.json();
+          setLlmSummary(data.summary || "");
+        }
+      } catch (err) {
+        console.error("Error fetching LLM summary:", err);
+      } finally {
+        setLlmSummaryLoading(false);
+      }
+    };
+
     fetchStockDetail();
     fetchSignalHistory();
+    fetchLlmSummary();
   }, [selectedTicker]);
 
   // Trigger manual backend worker sync
@@ -375,6 +679,59 @@ export default function TerminalDashboard() {
     }
   };
 
+  const updateAccountRiskLimit = async (accountId: string, maxDd: number) => {
+    try {
+      const res = await fetch(`${API_URL}/api/mt5/accounts/${accountId}/risk`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_drawdown_percent: maxDd })
+      });
+      if (res.ok) {
+        fetchData();
+      }
+    } catch (err) {
+      console.error("Failed to update account risk limit:", err);
+    }
+  };
+
+
+  const optimizeParameters = async () => {
+    if (!selectedTicker) return;
+    setOptimizationLoading(true);
+    setOptimizationResults(null);
+    try {
+      const res = await fetch(`${API_URL}/api/backtest/optimize`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ticker: selectedTicker }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setOptimizationResults(data);
+      }
+    } catch (error) {
+      console.error("Optimization failed:", error);
+    } finally {
+      setOptimizationLoading(false);
+    }
+  };
+
+  const saveAccountRisk = async (accountId: string, limit: number) => {
+    try {
+      const res = await fetch(`${API_URL}/api/mt5/accounts/${accountId}/risk`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_drawdown_percent: limit })
+      });
+      if (res.ok) {
+        fetchData();
+      }
+    } catch (error) {
+      console.error("Failed to save account risk:", error);
+    }
+  };
 
   const runBacktest = async () => {
     if (!selectedTicker) return;
@@ -391,6 +748,7 @@ export default function TerminalDashboard() {
           sell_rsi: Number(backtestSellRsi),
           buy_sentiment: Number(backtestBuySent),
           sell_sentiment: Number(backtestSellSent),
+          initial_capital: Number(backtestCapital),
         }),
       });
       if (res.ok) {
@@ -515,6 +873,10 @@ export default function TerminalDashboard() {
     }
     companiesByCountry[item.country].push(item);
   });
+
+  if (!isAuthenticated) {
+    return <LoginScreen onLogin={() => setIsAuthenticated(true)} API_URL={API_URL} />;
+  }
 
   return (
     <div className="min-h-screen grid-terminal bg-terminal-bg flex flex-col p-3">
@@ -652,8 +1014,72 @@ export default function TerminalDashboard() {
         </div>
       )}
 
-      {/* Main Grid: Heatmap, Screener & News */}
-      <div className="grid grid-cols-1 xl:grid-cols-4 gap-3 flex-1">
+      {/* Main Tab Navigation */}
+      <div className="flex border border-terminal-border mb-3 bg-terminal-card rounded p-1 gap-1 shrink-0">
+        <button
+          onClick={() => setMainTab("dashboard")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition ${
+            mainTab === "dashboard"
+              ? "bg-terminal-accent text-black font-extrabold shadow-[0_0_8px_rgba(255,153,0,0.3)]"
+              : "text-slate-400 hover:text-white hover:bg-terminal-bg/50"
+          }`}
+        >
+          📊 Dashboard Monitor
+        </button>
+        <button
+          onClick={() => setMainTab("risk_telemetry")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition ${
+            mainTab === "risk_telemetry"
+              ? "bg-terminal-accent text-black font-extrabold shadow-[0_0_8px_rgba(255,153,0,0.3)]"
+              : "text-slate-400 hover:text-white hover:bg-terminal-bg/50"
+          }`}
+        >
+          🛡️ Risk & Telemetry
+        </button>
+        <button
+          onClick={() => setMainTab("correlation")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition ${
+            mainTab === "correlation"
+              ? "bg-terminal-accent text-black font-extrabold shadow-[0_0_8px_rgba(255,153,0,0.3)]"
+              : "text-slate-400 hover:text-white hover:bg-terminal-bg/50"
+          }`}
+        >
+          🧮 Correlation Heatmap
+        </button>
+        <button
+          onClick={() => setMainTab("backtest")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition ${
+            mainTab === "backtest"
+              ? "bg-terminal-accent text-black font-extrabold shadow-[0_0_8px_rgba(255,153,0,0.3)]"
+              : "text-slate-400 hover:text-white hover:bg-terminal-bg/50"
+          }`}
+        >
+          🚀 Portfolio Backtest
+        </button>
+        <button
+          onClick={() => setMainTab("ai_ml")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition ${
+            mainTab === "ai_ml"
+              ? "bg-terminal-accent text-black font-extrabold shadow-[0_0_8px_rgba(255,153,0,0.3)]"
+              : "text-slate-400 hover:text-white hover:bg-terminal-bg/50"
+          }`}
+        >
+          🧠 AI/ML Engine
+        </button>
+        <button
+          onClick={() => setMainTab("audit_log")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition ${
+            mainTab === "audit_log"
+              ? "bg-terminal-accent text-black font-extrabold shadow-[0_0_8px_rgba(255,153,0,0.3)]"
+              : "text-slate-400 hover:text-white hover:bg-terminal-bg/50"
+          }`}
+        >
+          🔐 Compliance Audit
+        </button>
+      </div>
+
+      {mainTab === "dashboard" && (
+        <div className="grid grid-cols-1 xl:grid-cols-4 gap-3 flex-1">
         
         {/* Left 3 columns: Heatmap & Screener */}
         <div className="xl:col-span-3 flex flex-col gap-3">
@@ -686,7 +1112,13 @@ export default function TerminalDashboard() {
                        country === "France" ? "🇫🇷 FRANCE" :
                        country === "Germany" ? "🇩🇪 GERMANY" :
                        country === "Spain" ? "🇪🇸 SPAIN" :
-                       country === "United Kingdom" ? "🇬🇧 UK" : country}
+                       country === "United Kingdom" ? "🇬🇧 UK" :
+                       country === "USA" ? "🇺🇸 USA" :
+                       country === "Japan" ? "🇯🇵 JAPAN" :
+                       country === "Hong Kong" ? "🇭🇰 HK" :
+                       country === "South Korea" ? "🇰🇷 KOREA" :
+                       country === "Taiwan" ? "🇹🇼 TAIWAN" : 
+                       country === "Crypto" ? "🪙 CRYPTO" : country.toUpperCase()}
                     </h3>
                     <div className="grid grid-cols-2 gap-1.5">
                       {companiesByCountry[country].map((stock) => (
@@ -786,6 +1218,7 @@ export default function TerminalDashboard() {
                     <th className="py-2 font-black text-right">VAR. 24H</th>
                     <th className="py-2 font-black text-center">DEC. SENTIMENT</th>
                     <th className="py-2 font-black text-center">AI SIGNAL</th>
+                    <th className="py-2 font-black text-center">ML CONF.</th>
                     <th className="py-2 font-black text-center">AZIONE</th>
                   </tr>
                 </thead>
@@ -812,6 +1245,9 @@ export default function TerminalDashboard() {
                           <span className={`px-2 py-0.5 rounded text-[9px] uppercase ${getSignalBadge(row.signal)}`}>
                             {row.signal}
                           </span>
+                        </td>
+                        <td className="py-2.5 text-center font-mono font-bold text-slate-350">
+                          🧠 {row.ml_prediction_prob ? `${(row.ml_prediction_prob * 100).toFixed(0)}%` : "50%"}
                         </td>
                         <td className="py-2.5 text-center">
                           <button
@@ -846,6 +1282,9 @@ export default function TerminalDashboard() {
                             {row.signal}
                           </span>
                         </td>
+                        <td className="py-2.5 text-center font-mono text-slate-500">
+                          -
+                        </td>
                         <td className="py-2.5 text-center">
                           <button
                             onClick={() => setSelectedTicker(row.ticker)}
@@ -859,7 +1298,7 @@ export default function TerminalDashboard() {
                   )}
                   {((screenerTab === "stocks" && filteredScreener.length === 0) || (screenerTab === "forex" && filteredForex.length === 0)) && (
                     <tr>
-                      <td colSpan={8} className="py-8 text-center text-terminal-muted">
+                      <td colSpan={9} className="py-8 text-center text-terminal-muted">
                         Nessun asset corrispondente ai filtri.
                       </td>
                     </tr>
@@ -1053,6 +1492,914 @@ export default function TerminalDashboard() {
           </div>
         </div>
       </div>
+      )}
+
+      {/* Tab 2: Risk Analytics & Telemetry */}
+      {mainTab === "risk_telemetry" && (
+        <div className="grid grid-cols-1 xl:grid-cols-4 gap-3 flex-1">
+          {/* Left 2 columns: Notification Config & Multi-Account Limit */}
+          <div className="xl:col-span-2 flex flex-col gap-3">
+            {/* Notifications panel */}
+            <div className="bg-terminal-card border border-terminal-border p-4 rounded">
+              <h2 className="text-xs font-black uppercase text-slate-400 mb-3 border-b border-terminal-border pb-2 flex items-center gap-2">
+                🔔 Impostazioni Notifiche di Segnale (Telegram / Discord)
+              </h2>
+              
+              <div className="flex flex-col gap-3 text-xs">
+                <div>
+                  <label className="block text-slate-500 font-bold mb-1">Telegram Bot Token</label>
+                  <input
+                    type="password"
+                    placeholder="E.g., 123456:ABC-DEF..."
+                    value={telegramBotToken}
+                    onChange={(e) => setTelegramBotToken(e.target.value)}
+                    className="w-full bg-terminal-bg border border-terminal-border rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-terminal-accent font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-500 font-bold mb-1">Telegram Chat ID</label>
+                  <input
+                    type="text"
+                    placeholder="E.g., -100123456789"
+                    value={telegramChatId}
+                    onChange={(e) => setTelegramChatId(e.target.value)}
+                    className="w-full bg-terminal-bg border border-terminal-border rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-terminal-accent font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-500 font-bold mb-1">Discord Webhook URL</label>
+                  <input
+                    type="password"
+                    placeholder="https://discord.com/api/webhooks/..."
+                    value={discordWebhookUrl}
+                    onChange={(e) => setDiscordWebhookUrl(e.target.value)}
+                    className="w-full bg-terminal-bg border border-terminal-border rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-terminal-accent font-mono"
+                  />
+                </div>
+                <button
+                  onClick={async () => {
+                    setSettingsSaving(true);
+                    try {
+                      const res = await fetch(`${API_URL}/api/system-settings`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                          telegram_bot_token: telegramBotToken,
+                          telegram_chat_id: telegramChatId,
+                          discord_webhook_url: discordWebhookUrl
+                        })
+                      });
+                      if (res.ok) alert("Impostazioni notifica salvate con successo!");
+                    } catch (err) {
+                      console.error(err);
+                    } finally {
+                      setSettingsSaving(false);
+                    }
+                  }}
+                  disabled={settingsSaving}
+                  className="mt-2 w-full bg-terminal-accent text-black font-extrabold py-2 px-4 rounded hover:bg-terminal-accent/80 transition"
+                >
+                  {settingsSaving ? "SALVATAGGIO IN CORSO..." : "SALVA IMPOSTAZIONI DI NOTIFICA"}
+                </button>
+              </div>
+            </div>
+
+            {/* Per-Account Risk Limits table */}
+            <div className="bg-terminal-card border border-terminal-border p-4 rounded flex-1">
+              <h2 className="text-xs font-black uppercase text-slate-400 mb-3 border-b border-terminal-border pb-2 flex items-center gap-2">
+                🛡️ Account Drawdown Limiti Granulari (MetaTrader 5)
+              </h2>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs text-left border-collapse">
+                  <thead>
+                    <tr className="border-b border-terminal-border text-slate-500 uppercase tracking-wider text-[9px] font-black">
+                      <th className="py-2">Account ID</th>
+                      <th className="py-2">Broker</th>
+                      <th className="py-2">Balance</th>
+                      <th className="py-2">Drawdown %</th>
+                      <th className="py-2">Max DD Limit %</th>
+                      <th className="py-2 text-right">Azione</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {brokerAccounts.map((acct) => {
+                      const bal_val = acct.balance || 0.0;
+                      const eq_val = acct.equity || 0.0;
+                      const dd = bal_val > eq_val && bal_val > 0 ? ((bal_val - eq_val) / bal_val * 100.0) : 0.0;
+                      const riskAcc = riskAccounts.find(r => r.account_id === acct.account_id);
+                      const max_dd_limit = riskAcc ? riskAcc.max_drawdown_percent : 5.0;
+
+                      return (
+                        <tr key={acct.account_id} className="border-b border-terminal-border/20 hover:bg-terminal-bg/20 font-mono">
+                          <td className="py-2.5 font-bold text-terminal-accent">{acct.account_id}</td>
+                          <td className="py-2.5 text-slate-350 font-sans font-bold">{acct.broker}</td>
+                          <td className="py-2.5">€ {bal_val.toFixed(2)}</td>
+                          <td className={`py-2.5 font-bold ${dd > max_dd_limit ? "text-rose-455" : "text-slate-300"}`}>
+                            {dd.toFixed(2)}%
+                          </td>
+                          <td className="py-2.5">{max_dd_limit.toFixed(1)}%</td>
+                          <td className="py-2.5 text-right font-sans">
+                            <button
+                              onClick={() => {
+                                const val = prompt("Inserisci il nuovo limite di drawdown (%) per questo account:", String(max_dd_limit));
+                                if (val && !isNaN(parseFloat(val))) {
+                                  updateAccountRiskLimit(acct.account_id, parseFloat(val));
+                                }
+                              }}
+                              className="bg-terminal-border hover:bg-terminal-accent hover:text-black px-2.5 py-1 rounded text-[10px] font-bold uppercase transition"
+                            >
+                              Modifica
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {brokerAccounts.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="py-8 text-center text-terminal-muted font-sans">
+                          Nessun account MT5 connesso rilevato.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          {/* Right 2 columns: VaR / Sharpe / Sortino & Equity Curve Area Chart */}
+          <div className="xl:col-span-2 flex flex-col gap-3">
+            <div className="bg-terminal-card border border-terminal-border p-4 rounded flex-1 flex flex-col">
+              <h2 className="text-xs font-black uppercase text-slate-400 mb-3 border-b border-terminal-border pb-2">
+                🧮 Portfolio Risk Analytics & Telemetry
+              </h2>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-center mb-4">
+                <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                  <span className="text-[9px] text-slate-500 block uppercase font-bold">Value at Risk (VaR 95%)</span>
+                  <span className="text-base font-mono font-black text-rose-400">
+                    {riskAnalytics ? `${riskAnalytics.value_at_risk_95.toFixed(2)}%` : "CALCULATING..."}
+                  </span>
+                </div>
+                <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                  <span className="text-[9px] text-slate-500 block uppercase font-bold">Sharpe Ratio</span>
+                  <span className="text-base font-mono font-black text-emerald-400">
+                    {riskAnalytics ? riskAnalytics.sharpe_ratio.toFixed(2) : "CALCULATING..."}
+                  </span>
+                </div>
+                <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                  <span className="text-[9px] text-slate-500 block uppercase font-bold">Sortino Ratio</span>
+                  <span className="text-base font-mono font-black text-emerald-400">
+                    {riskAnalytics ? riskAnalytics.sortino_ratio.toFixed(2) : "CALCULATING..."}
+                  </span>
+                </div>
+                <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                  <span className="text-[9px] text-slate-500 block uppercase font-bold">Max Drawdown</span>
+                  <span className="text-base font-mono font-black text-amber-500">
+                    {riskAnalytics ? `${riskAnalytics.max_drawdown.toFixed(2)}%` : "CALCULATING..."}
+                  </span>
+                </div>
+              </div>
+
+              <h3 className="text-[10px] font-black uppercase text-slate-500 mb-2 tracking-wider">
+                Simulazione Curve Equity Portafoglio (Modello Equal-Weight 60gg)
+              </h3>
+              <div className="flex-1 min-h-[280px] bg-terminal-bg/30 border border-terminal-border rounded p-2">
+                {riskAnalytics && riskAnalytics.equity_curve && riskAnalytics.equity_curve.length > 0 ? (
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={riskAnalytics.equity_curve} margin={{ top: 10, right: 10, left: 10, bottom: 5 }}>
+                      <defs>
+                        <linearGradient id="colorEq" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#ff9900" stopOpacity={0.25}/>
+                          <stop offset="95%" stopColor="#ff9900" stopOpacity={0.0}/>
+                        </linearGradient>
+                      </defs>
+                      <XAxis dataKey="date" stroke="#475569" fontSize={9} tickLine={false} />
+                      <YAxis stroke="#475569" fontSize={9} domain={['dataMin - 500', 'dataMax + 500']} tickLine={false} />
+                      <Tooltip
+                        contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #334155" }}
+                        labelStyle={{ color: "#94a3b8", fontWeight: "bold" }}
+                        itemStyle={{ color: "#ff9900", fontFamily: "monospace" }}
+                      />
+                      <Area type="monotone" dataKey="equity" stroke="#ff9900" strokeWidth={2} fillOpacity={1} fill="url(#colorEq)" name="Equity (€)" />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div className="h-full flex items-center justify-center text-xs text-terminal-muted font-sans">
+                    Caricamento curva equity in corso...
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="bg-terminal-card border border-terminal-border p-4 rounded flex-1 flex flex-col">
+              <h2 className="text-xs font-black uppercase text-slate-400 mb-3 border-b border-terminal-border pb-2 flex items-center gap-2">
+                🎲 Stress-Test & Proiezioni Predittive Monte Carlo (30 Giorni)
+              </h2>
+              {monteCarloLoading ? (
+                <div className="h-48 flex items-center justify-center text-xs text-terminal-muted">
+                  Simulazione di 1.000 percorsi di portafoglio in corso...
+                </div>
+              ) : monteCarloResults ? (
+                <div className="flex-1 flex flex-col gap-3">
+                  <div className="grid grid-cols-3 gap-3 text-center mb-2">
+                    <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                      <span className="text-[9px] text-slate-500 block uppercase font-bold">VaR 95% (30-gg)</span>
+                      <span className="text-xs font-mono font-black text-rose-400">
+                        {monteCarloResults.var_95.toFixed(2)}%
+                      </span>
+                    </div>
+                    <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                      <span className="text-[9px] text-slate-500 block uppercase font-bold">CVaR 95% (Stress)</span>
+                      <span className="text-xs font-mono font-black text-rose-500">
+                        {monteCarloResults.cvar_95.toFixed(2)}%
+                      </span>
+                    </div>
+                    <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                      <span className="text-[9px] text-slate-500 block uppercase font-bold">Prob. Drawdown &gt; 5%</span>
+                      <span className="text-xs font-mono font-black text-amber-500">
+                        {monteCarloResults.prob_drawdown_5.toFixed(1)}%
+                      </span>
+                    </div>
+                  </div>
+                  
+                  <div className="flex-1 min-h-[220px] bg-terminal-bg/30 border border-terminal-border rounded p-2">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={monteCarloResults.paths} margin={{ top: 10, right: 10, left: 10, bottom: 5 }}>
+                        <defs>
+                          <linearGradient id="colorP95" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#10b981" stopOpacity={0.15}/>
+                            <stop offset="95%" stopColor="#10b981" stopOpacity={0.0}/>
+                          </linearGradient>
+                          <linearGradient id="colorP5" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#ef4444" stopOpacity={0.15}/>
+                            <stop offset="95%" stopColor="#ef4444" stopOpacity={0.0}/>
+                          </linearGradient>
+                        </defs>
+                        <XAxis dataKey="day" stroke="#475569" fontSize={9} tickLine={false} />
+                        <YAxis stroke="#475569" fontSize={9} domain={['dataMin - 200', 'dataMax + 200']} tickLine={false} />
+                        <Tooltip
+                          contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #334155" }}
+                          labelStyle={{ color: "#94a3b8", fontWeight: "bold" }}
+                          itemStyle={{ fontFamily: "monospace", fontSize: 10 }}
+                        />
+                        <Area type="monotone" dataKey="p95" stroke="#10b981" strokeWidth={1.5} fillOpacity={1} fill="url(#colorP95)" name="Ottimistico (P95)" />
+                        <Area type="monotone" dataKey="p50" stroke="#f97316" strokeWidth={2} fill="none" name="Mediano (P50)" />
+                        <Area type="monotone" dataKey="p5" stroke="#ef4444" strokeWidth={1.5} fillOpacity={1} fill="url(#colorP5)" name="Stress Test (P5)" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              ) : (
+                <div className="h-48 flex items-center justify-center text-xs text-terminal-muted">
+                  Nessun dato di simulazione disponibile.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tab 3: Correlation Matrix */}
+      {mainTab === "correlation" && (
+        <div className="bg-terminal-card border border-terminal-border p-4 rounded flex flex-col flex-1">
+          <div className="border-b border-terminal-border pb-2 mb-3">
+            <h2 className="text-xs font-black uppercase text-slate-400 flex items-center gap-2">
+              🧮 Matrix di Correlazione Storica Multi-Asset (Pearson - 60 Giorni)
+            </h2>
+            <p className="text-[10px] text-terminal-muted mt-1">
+              Fornisce una mappa di calore della correlazione giornaliera dei rendimenti a 60 giorni. I colori verdi indicano correlazione positiva, i rossi indicano correlazione negativa, mentre i grigi indicano correlazione debole o assente.
+            </p>
+          </div>
+
+          {correlationData ? (
+            <div className="overflow-auto flex-1 flex flex-col items-center justify-start p-4">
+              <div className="min-w-[800px]">
+                {/* Header Row */}
+                <div className="flex mb-1.5">
+                  <div className="w-24 shrink-0"></div>
+                  {correlationData.tickers.map((t) => (
+                    <div key={t} className="w-14 text-center text-[9px] font-black text-slate-400 shrink-0 font-mono truncate px-0.5">
+                      {t.split('.')[0]}
+                    </div>
+                  ))}
+                </div>
+
+                {/* Matrix Rows */}
+                {correlationData.tickers.map((rowTicker, rIdx) => (
+                  <div key={rowTicker} className="flex mb-1 items-center">
+                    {/* Row Label */}
+                    <div className="w-24 text-right text-[10px] font-bold text-slate-400 shrink-0 pr-3 font-mono truncate">
+                      {rowTicker.split('.')[0]}
+                    </div>
+
+                    {/* Grid Cells */}
+                    {correlationData.matrix[rIdx].map((val, cIdx) => {
+                      let cellClass = "bg-slate-900/50 text-slate-400";
+                      if (val > 0.7) cellClass = "bg-emerald-900 text-emerald-100 font-bold";
+                      else if (val > 0.3) cellClass = "bg-emerald-950 text-emerald-350";
+                      else if (val < -0.7) cellClass = "bg-rose-900 text-rose-100 font-bold";
+                      else if (val < -0.3) cellClass = "bg-rose-950 text-rose-350";
+
+                      return (
+                        <div
+                          key={cIdx}
+                          title={`Correlazione ${rowTicker} & ${correlationData.tickers[cIdx]} = ${val.toFixed(3)}`}
+                          className={`w-14 h-10 flex items-center justify-center text-[10px] font-mono shrink-0 rounded border border-terminal-bg/40 transition hover:scale-110 hover:shadow-lg ${cellClass}`}
+                        >
+                          {val.toFixed(2)}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="h-64 flex items-center justify-center text-xs text-terminal-muted">
+              Caricamento matrice di correlazione in corso...
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Tab 4: Portfolio Backtester */}
+      {mainTab === "backtest" && (
+        <div className="grid grid-cols-1 xl:grid-cols-4 gap-3 flex-1">
+          {/* Left Column: Config Parameters & Asset Checkboxes */}
+          <div className="xl:col-span-1 bg-terminal-card border border-terminal-border p-4 rounded flex flex-col shrink-0">
+            <h2 className="text-xs font-black uppercase text-slate-400 mb-3 border-b border-terminal-border pb-2 flex items-center gap-1.5">
+              ⚙️ Configurazione Portfolio Backtest
+            </h2>
+            
+            <div className="flex flex-col gap-3 text-xs flex-1">
+              <div>
+                <label className="block text-slate-500 font-bold mb-1">Capitale Iniziale (€)</label>
+                <input
+                  type="number"
+                  value={backtestCapital}
+                  onChange={(e) => setBacktestCapital(Number(e.target.value))}
+                  className="w-full bg-terminal-bg border border-terminal-border rounded px-2.5 py-1.5 text-slate-200 focus:outline-none focus:border-terminal-accent font-mono"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-slate-500 font-bold mb-1">Buy RSI &lt;=</label>
+                  <input
+                    type="number"
+                    value={backtestBuyRsi}
+                    onChange={(e) => setBacktestBuyRsi(Number(e.target.value))}
+                    className="w-full bg-terminal-bg border border-terminal-border rounded px-2 py-1 text-slate-200 focus:outline-none focus:border-terminal-accent font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-500 font-bold mb-1">Sell RSI &gt;=</label>
+                  <input
+                    type="number"
+                    value={backtestSellRsi}
+                    onChange={(e) => setBacktestSellRsi(Number(e.target.value))}
+                    className="w-full bg-terminal-bg border border-terminal-border rounded px-2 py-1 text-slate-200 focus:outline-none focus:border-terminal-accent font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-slate-500 font-bold mb-1">Buy Sentiment &gt;=</label>
+                  <input
+                    type="number"
+                    step="0.05"
+                    value={backtestBuySent}
+                    onChange={(e) => setBacktestBuySent(Number(e.target.value))}
+                    className="w-full bg-terminal-bg border border-terminal-border rounded px-2 py-1 text-slate-200 focus:outline-none focus:border-terminal-accent font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-500 font-bold mb-1">Sell Sentiment &lt;=</label>
+                  <input
+                    type="number"
+                    step="0.05"
+                    value={backtestSellSent}
+                    onChange={(e) => setBacktestSellSent(Number(e.target.value))}
+                    className="w-full bg-terminal-bg border border-terminal-border rounded px-2 py-1 text-slate-200 focus:outline-none focus:border-terminal-accent font-mono"
+                  />
+                </div>
+              </div>
+
+              {/* Ticker checklist */}
+              <div className="flex-1 flex flex-col min-h-[160px]">
+                <div className="flex justify-between items-center mb-1">
+                  <span className="text-slate-500 font-bold">Tickers ({selectedPortfolioTickers.length})</span>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setSelectedPortfolioTickers(screener.map(s => s.ticker))}
+                      className="text-[9px] text-terminal-accent hover:underline uppercase font-bold"
+                    >
+                      Tutti
+                    </button>
+                    <button
+                      onClick={() => setSelectedPortfolioTickers([])}
+                      className="text-[9px] text-slate-500 hover:underline uppercase font-bold"
+                    >
+                      Nessuno
+                    </button>
+                  </div>
+                </div>
+                <div className="border border-terminal-border rounded bg-terminal-bg/50 p-2 overflow-y-auto flex-1 max-h-[180px]">
+                  {screener.map((s) => (
+                    <label key={s.ticker} className="flex items-center gap-2 py-1 hover:bg-terminal-bg/30 px-1 rounded cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={selectedPortfolioTickers.includes(s.ticker)}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            setSelectedPortfolioTickers([...selectedPortfolioTickers, s.ticker]);
+                          } else {
+                            setSelectedPortfolioTickers(selectedPortfolioTickers.filter(t => t !== s.ticker));
+                          }
+                        }}
+                        className="rounded border-slate-700 text-terminal-accent focus:ring-terminal-accent"
+                      />
+                      <span className="font-mono text-xs">{s.ticker}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <button
+                onClick={async () => {
+                  if (selectedPortfolioTickers.length === 0) {
+                    alert("Seleziona almeno un ticker per avviare il backtest!");
+                    return;
+                  }
+                  setPortfolioBacktestLoading(true);
+                  try {
+                    const res = await fetch(`${API_URL}/api/backtest/portfolio`, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({
+                        tickers: selectedPortfolioTickers,
+                        capital: backtestCapital,
+                        buy_rsi: backtestBuyRsi,
+                        sell_rsi: backtestSellRsi,
+                        buy_sentiment: backtestBuySent,
+                        sell_sentiment: backtestSellSent
+                      })
+                    });
+                    if (res.ok) {
+                      const data = await res.json();
+                      setPortfolioBacktestResults(data);
+                    } else {
+                      const err = await res.json();
+                      alert(`Errore: ${err.detail || "Impossibile eseguire il backtest"}`);
+                    }
+                  } catch (err) {
+                    console.error(err);
+                  } finally {
+                    setPortfolioBacktestLoading(false);
+                  }
+                }}
+                disabled={portfolioBacktestLoading || selectedPortfolioTickers.length === 0}
+                className={`w-full font-black uppercase text-xs py-2 px-4 rounded transition flex items-center justify-center gap-1.5 ${
+                  portfolioBacktestLoading || selectedPortfolioTickers.length === 0
+                    ? "bg-terminal-card border border-terminal-border text-terminal-muted cursor-not-allowed"
+                    : "bg-terminal-accent text-black font-extrabold hover:bg-terminal-accent/80 shadow-[0_0_8px_rgba(255,153,0,0.3)]"
+                }`}
+              >
+                {portfolioBacktestLoading ? "ESECUZIONE BACKTEST..." : "AVVIA PORTFOLIO BACKTEST"}
+              </button>
+
+              {/* Portfolio Weight Optimization Section */}
+              <div className="border-t border-terminal-border pt-4 mt-2">
+                <h3 className="text-[10px] font-black uppercase text-slate-400 mb-2 tracking-wider flex items-center gap-1">
+                  💼 Ottimizzazione Pesi (MVO)
+                </h3>
+                <div className="grid grid-cols-2 gap-2 mb-2">
+                  <div>
+                    <label className="block text-slate-500 font-bold mb-0.5">Metodo</label>
+                    <select
+                      value={optMethod}
+                      onChange={(e) => setOptMethod(e.target.value as any)}
+                      className="w-full bg-terminal-bg border border-terminal-border rounded px-1.5 py-1 text-slate-200 focus:outline-none focus:border-terminal-accent text-xs font-mono"
+                    >
+                      <option value="max_sharpe">Max Sharpe</option>
+                      <option value="min_volatility">Min Vol</option>
+                    </select>
+                  </div>
+                  <div className="flex items-center gap-1.5 mt-4">
+                    <input
+                      type="checkbox"
+                      id="useBLCheck"
+                      checked={useBL}
+                      onChange={(e) => setUseBL(e.target.checked)}
+                      className="rounded border-slate-700 text-terminal-accent focus:ring-terminal-accent"
+                    />
+                    <label htmlFor="useBLCheck" className="text-slate-400 text-[10px] cursor-pointer">Black-Litterman</label>
+                  </div>
+                </div>
+                <button
+                  onClick={async () => {
+                    if (selectedPortfolioTickers.length === 0) {
+                      alert("Seleziona almeno un ticker per ottimizzare i pesi!");
+                      return;
+                    }
+                    setPortfolioWeightsLoading(true);
+                    try {
+                      const res = await fetch(`${API_URL}/api/portfolio/optimize`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                          tickers: selectedPortfolioTickers,
+                          method: optMethod,
+                          use_black_litterman: useBL,
+                          rf_rate: 0.0
+                        })
+                      });
+                      if (res.ok) {
+                        const data = await res.json();
+                        setPortfolioWeights(data.weights);
+                      } else {
+                        const err = await res.json();
+                        alert(`Errore: ${err.detail || "Impossibile ottimizzare i pesi"}`);
+                      }
+                    } catch (err) {
+                      console.error(err);
+                    } finally {
+                      setPortfolioWeightsLoading(false);
+                    }
+                  }}
+                  disabled={portfolioWeightsLoading || selectedPortfolioTickers.length === 0}
+                  className="w-full bg-terminal-border hover:bg-terminal-accent hover:text-black font-black uppercase text-[10px] py-1.5 px-3 rounded transition text-slate-200"
+                >
+                  {portfolioWeightsLoading ? "CALCOLO IN CORSO..." : "CALCOLA PESI OTTIMALI"}
+                </button>
+                
+                {portfolioWeights && (
+                  <div className="mt-2 border border-terminal-border bg-terminal-bg/30 p-2 rounded max-h-[120px] overflow-y-auto">
+                    <table className="w-full text-[10px] font-mono text-left">
+                      <thead>
+                        <tr className="text-slate-500 font-bold border-b border-terminal-border/40">
+                          <th className="pb-1">Asset</th>
+                          <th className="pb-1 text-right">Peso</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(portfolioWeights).map(([t, w]) => (
+                          <tr key={t} className="border-b border-terminal-border/10">
+                            <td className="py-1 text-slate-300 font-bold">{t}</td>
+                            <td className="py-1 text-right text-terminal-accent font-black">{(w * 100).toFixed(1)}%</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+
+              {/* WFO Parameter Sweep Section */}
+              <div className="border-t border-terminal-border pt-4 mt-2">
+                <h3 className="text-[10px] font-black uppercase text-slate-400 mb-2 tracking-wider flex items-center gap-1">
+                  🔍 Sweep Parametri Ottimali (WFO)
+                </h3>
+                <button
+                  onClick={async () => {
+                    if (selectedPortfolioTickers.length === 0) {
+                      alert("Seleziona almeno un ticker per avviare lo sweep!");
+                      return;
+                    }
+                    setWfoLoading(true);
+                    try {
+                      const res = await fetch(`${API_URL}/api/backtest/optimize-params`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                          tickers: selectedPortfolioTickers,
+                          capital: backtestCapital
+                        })
+                      });
+                      if (res.ok) {
+                        const data = await res.json();
+                        if (data.status === "success") {
+                          setWfoResults(data.best_params);
+                        } else {
+                          alert("Nessun dato sufficiente per calcolare lo sweep.");
+                        }
+                      }
+                    } catch (err) {
+                      console.error(err);
+                    } finally {
+                      setWfoLoading(false);
+                    }
+                  }}
+                  disabled={wfoLoading || selectedPortfolioTickers.length === 0}
+                  className="w-full bg-terminal-border hover:bg-terminal-accent hover:text-black font-black uppercase text-[10px] py-1.5 px-3 rounded transition text-slate-200"
+                >
+                  {wfoLoading ? "SWEEP IN CORSO..." : "AVVIA SWEEP DI PARAMETRI"}
+                </button>
+                
+                {wfoResults && wfoResults.length > 0 && (
+                  <div className="mt-2 flex flex-col gap-2 max-h-[180px] overflow-y-auto">
+                    {wfoResults.map((r, idx) => (
+                      <div key={idx} className="border border-terminal-border/60 bg-terminal-bg/50 p-2 rounded text-[10px] font-mono flex flex-col gap-1">
+                        <div className="flex justify-between items-center text-slate-400 font-bold border-b border-terminal-border/20 pb-1">
+                          <span>Combo #{idx + 1}</span>
+                          <span className="text-emerald-400">Sharpe: {r.sharpe_ratio}</span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-x-2 text-[9px] text-slate-350">
+                          <div>Buy RSI: <span className="text-slate-100 font-bold">{r.buy_rsi}</span></div>
+                          <div>Sell RSI: <span className="text-slate-100 font-bold">{r.sell_rsi}</span></div>
+                          <div>Buy Sent: <span className="text-slate-100 font-bold">{r.buy_sentiment}</span></div>
+                          <div>Sell Sent: <span className="text-slate-100 font-bold">{r.sell_sentiment}</span></div>
+                          <div className="col-span-2 text-slate-400 mt-1">Ret: <span className="text-emerald-400 font-bold">{r.total_return_percent}%</span> | DD: <span className="text-amber-500 font-bold">{r.max_drawdown}%</span></div>
+                        </div>
+                        <button
+                          onClick={() => {
+                            setBacktestBuyRsi(r.buy_rsi);
+                            setBacktestSellRsi(r.sell_rsi);
+                            setBacktestBuySent(r.buy_sentiment);
+                            setBacktestSellSent(r.sell_sentiment);
+                          }}
+                          className="mt-1 bg-terminal-bg border border-terminal-border hover:border-terminal-accent text-terminal-accent hover:text-white uppercase font-bold py-0.5 rounded text-[8px] transition"
+                        >
+                          Applica Parametri
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+            </div>
+          </div>
+
+          {/* Right Column: Key Metrics & Backtest Equity Curve */}
+          <div className="xl:col-span-3 bg-terminal-card border border-terminal-border p-4 rounded flex flex-col">
+            <h2 className="text-xs font-black uppercase text-slate-400 mb-3 border-b border-terminal-border pb-2">
+              📈 Risultati Simulazione Backtest di Portafoglio
+            </h2>
+
+            {portfolioBacktestResults ? (
+              <div className="flex-1 flex flex-col gap-3">
+                {/* Key Metrics grid */}
+                <div className="grid grid-cols-2 md:grid-cols-5 gap-3 text-center">
+                  <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                    <span className="text-[9px] text-slate-500 block uppercase font-bold">Capitale Finale</span>
+                    <span className="text-base font-mono font-black text-slate-200">
+                      € {portfolioBacktestResults.final_capital.toLocaleString("de-DE", { minimumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                  <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                    <span className="text-[9px] text-slate-500 block uppercase font-bold">Rendimento Totale</span>
+                    <span className={`text-base font-mono font-black ${portfolioBacktestResults.total_return_percent >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                      {portfolioBacktestResults.total_return_percent >= 0 ? "+" : ""}{portfolioBacktestResults.total_return_percent.toFixed(2)}%
+                    </span>
+                  </div>
+                  <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                    <span className="text-[9px] text-slate-500 block uppercase font-bold">Max Drawdown</span>
+                    <span className="text-base font-mono font-black text-amber-500">
+                      {portfolioBacktestResults.max_drawdown.toFixed(2)}%
+                    </span>
+                  </div>
+                  <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                    <span className="text-[9px] text-slate-500 block uppercase font-bold">Win Rate</span>
+                    <span className="text-base font-mono font-black text-emerald-400">
+                      {portfolioBacktestResults.win_rate.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="bg-terminal-bg/50 border border-terminal-border p-2.5 rounded">
+                    <span className="text-[9px] text-slate-500 block uppercase font-bold">Operazioni Totali</span>
+                    <span className="text-base font-mono font-black text-slate-300">
+                      {portfolioBacktestResults.total_trades}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Equity Chart */}
+                <div className="flex-1 min-h-[300px] mt-2 bg-terminal-bg/30 border border-terminal-border rounded p-2">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart data={portfolioBacktestResults.equity_curve} margin={{ top: 10, right: 10, left: 10, bottom: 5 }}>
+                      <defs>
+                        <linearGradient id="colorEqBacktest" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#ff9900" stopOpacity={0.25}/>
+                          <stop offset="95%" stopColor="#ff9900" stopOpacity={0.0}/>
+                        </linearGradient>
+                      </defs>
+                      <XAxis dataKey="date" stroke="#475569" fontSize={9} tickLine={false} />
+                      <YAxis stroke="#475569" fontSize={9} domain={['dataMin - 500', 'dataMax + 500']} tickLine={false} />
+                      <Tooltip
+                        contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #334155" }}
+                        labelStyle={{ color: "#94a3b8", fontWeight: "bold" }}
+                        itemStyle={{ color: "#ff9900", fontFamily: "monospace" }}
+                      />
+                      <Area type="monotone" dataKey="equity" stroke="#ff9900" strokeWidth={2} fillOpacity={1} fill="url(#colorEqBacktest)" name="Capitale (€)" />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            ) : (
+              <div className="flex-1 flex flex-col items-center justify-center text-center text-terminal-muted p-10 border border-dashed border-terminal-border/40 rounded">
+                <Play className="h-8 w-8 text-terminal-muted/30 mb-2" />
+                <span className="text-xs">
+                  Imposta i parametri a sinistra, seleziona i ticker e premi "Avvia Portfolio Backtest" per visualizzare l'analisi di simulazione.
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {mainTab === "audit_log" && (
+        <div className="bg-terminal-card border border-terminal-border p-4 rounded flex flex-col flex-1 min-h-[500px]">
+          <div className="flex justify-between items-center border-b border-terminal-border pb-3 mb-4">
+            <div>
+              <h2 className="text-xs font-black uppercase text-slate-200 flex items-center gap-1.5">
+                🔐 Registro Audit di Sicurezza & Compliance
+              </h2>
+              <p className="text-[10px] text-slate-400 mt-1">
+                Tracciamento immutabile di tutte le azioni di controllo, override e modifiche ai parametri di rischio eseguiti sul framework.
+              </p>
+            </div>
+            <button
+              onClick={fetchAuditLogs}
+              disabled={auditLogsLoading}
+              className="bg-terminal-bg border border-terminal-border hover:border-terminal-accent text-slate-300 hover:text-white px-3 py-1.5 rounded text-xs font-bold transition flex items-center gap-1.5"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${auditLogsLoading ? "animate-spin" : ""}`} />
+              AGGIORNA LOGS
+            </button>
+          </div>
+
+          {auditLogsLoading ? (
+            <div className="flex-1 flex items-center justify-center text-slate-400">
+              <RefreshCw className="h-6 w-6 animate-spin text-terminal-accent mr-2" />
+              Caricamento del registro di audit in corso...
+            </div>
+          ) : auditLogs.length === 0 ? (
+            <div className="flex-1 flex items-center justify-center text-xs text-slate-500 border border-dashed border-terminal-border/40 rounded p-10">
+              Nessun evento registrato nel log di audit.
+            </div>
+          ) : (
+            <div className="flex-1 overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs font-mono">
+                <thead>
+                  <tr className="border-b border-terminal-border text-slate-500 font-bold uppercase text-[10px] tracking-wider">
+                    <th className="py-2.5 px-3">Data (Zulu)</th>
+                    <th className="py-2.5 px-3">Utente</th>
+                    <th className="py-2.5 px-3">Azione</th>
+                    <th className="py-2.5 px-3">Indirizzo IP</th>
+                    <th className="py-2.5 px-3 w-1/2">Dettagli Modifica</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {auditLogs.map((log) => (
+                    <tr key={log.id} className="border-b border-terminal-border/40 hover:bg-terminal-bg/30 transition text-slate-300">
+                      <td className="py-2 px-3 text-[11px] text-slate-400 whitespace-nowrap">
+                        {log.timestamp ? log.timestamp.replace("T", " ").substring(0, 19) : ""}
+                      </td>
+                      <td className="py-2 px-3 font-bold text-slate-200">
+                        {log.username}
+                      </td>
+                      <td className="py-2 px-3">
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-sans font-bold uppercase ${
+                          log.action.includes("kill") || log.action.includes("override")
+                            ? "bg-rose-500/20 text-rose-300 border border-rose-500/30"
+                            : "bg-terminal-accent/20 text-terminal-accent border border-terminal-accent/30"
+                        }`}>
+                          {log.action}
+                        </span>
+                      </td>
+                      <td className="py-2 px-3 text-slate-400">
+                        {log.ip_address}
+                      </td>
+                      <td className="py-2 px-3 text-slate-350 max-w-xs truncate font-mono text-[10px]">
+                        {typeof log.details === "object" ? JSON.stringify(log.details) : String(log.details)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {mainTab === "ai_ml" && (
+        <div className="bg-terminal-card border border-terminal-border p-4 rounded flex flex-col flex-1 min-h-[500px]">
+          <div className="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-terminal-border pb-3 mb-4 gap-3">
+            <div>
+              <h2 className="text-xs font-black uppercase text-slate-200 flex items-center gap-1.5">
+                🧠 Pannello di Controllo Intelligenza Artificiale & Machine Learning
+              </h2>
+              <p className="text-[10px] text-slate-400 mt-1">
+                Visualizzazione delle metriche di validazione walk-forward (ultimo 20% test split) e controllo dell'addestramento online dei modelli predittivi.
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={fetchMlMetrics}
+                disabled={mlMetricsLoading}
+                className="bg-terminal-bg border border-terminal-border hover:border-terminal-accent text-slate-300 hover:text-white px-3 py-1.5 rounded text-xs font-bold transition flex items-center gap-1.5"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${mlMetricsLoading ? "animate-spin" : ""}`} />
+                METRICHE
+              </button>
+              <button
+                onClick={triggerMlRetrain}
+                disabled={mlRetraining}
+                className="bg-terminal-accent hover:bg-amber-500 text-black px-4 py-1.5 rounded text-xs font-black uppercase transition flex items-center gap-1.5 shadow-[0_0_8px_rgba(255,153,0,0.25)]"
+              >
+                <Cpu className={`h-3.5 w-3.5 ${mlRetraining ? "animate-spin" : ""}`} />
+                {mlRetraining ? "ADDESTRAMENTO..." : "AVVIA RETRAIN ONLINE"}
+              </button>
+            </div>
+          </div>
+
+          {mlMetricsLoading ? (
+            <div className="flex-1 flex items-center justify-center text-slate-400">
+              <RefreshCw className="h-6 w-6 animate-spin text-terminal-accent mr-2" />
+              Caricamento metriche di validazione modelli in corso...
+            </div>
+          ) : mlMetrics.length === 0 ? (
+            <div className="flex-1 flex items-center justify-center text-xs text-slate-500 border border-dashed border-terminal-border/40 rounded p-10">
+              Nessuna metrica ML salvata nel database. Avvia un retrain per calcolare le metriche iniziali.
+            </div>
+          ) : (
+            <div className="flex-1 overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs font-mono">
+                <thead>
+                  <tr className="border-b border-terminal-border text-slate-500 font-bold uppercase text-[10px] tracking-wider">
+                    <th className="py-2.5 px-3">Ticker</th>
+                    <th className="py-2.5 px-3">Ultimo Addestramento</th>
+                    <th className="py-2.5 px-3">Accuracy (Test Split)</th>
+                    <th className="py-2.5 px-3">Precision</th>
+                    <th className="py-2.5 px-3">Recall</th>
+                    <th className="py-2.5 px-3">F1-Score</th>
+                    <th className="py-2.5 px-3">Campioni</th>
+                    <th className="py-2.5 px-3">Features Utilizzate</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {mlMetrics.map((metric) => (
+                    <tr key={metric.ticker} className="border-b border-terminal-border/40 hover:bg-terminal-bg/30 transition text-slate-300">
+                      <td className="py-2 px-3 font-bold text-slate-200 text-sm">
+                        {metric.ticker}
+                      </td>
+                      <td className="py-2 px-3 text-[11px] text-slate-400 whitespace-nowrap">
+                        {metric.last_trained ? metric.last_trained.replace("T", " ").substring(0, 19) : "N/D"}
+                      </td>
+                      <td className="py-2 px-3">
+                        <div className="flex items-center gap-2">
+                          <span className={`font-bold font-mono ${
+                            metric.accuracy >= 0.60
+                              ? "text-emerald-400"
+                              : metric.accuracy >= 0.52
+                              ? "text-amber-400"
+                              : "text-rose-400"
+                          }`}>
+                            {(metric.accuracy * 100).toFixed(1)}%
+                          </span>
+                          <div className="w-16 bg-slate-800 rounded-full h-1.5 overflow-hidden hidden sm:block">
+                            <div
+                              className={`h-full ${
+                                metric.accuracy >= 0.60
+                                  ? "bg-emerald-500"
+                                  : metric.accuracy >= 0.52
+                                  ? "bg-amber-500"
+                                  : "bg-rose-500"
+                              }`}
+                              style={{ width: `${Math.min(100, metric.accuracy * 100)}%` }}
+                            />
+                          </div>
+                        </div>
+                      </td>
+                      <td className="py-2 px-3 font-mono font-semibold text-slate-250">
+                        {(metric.precision * 100).toFixed(1)}%
+                      </td>
+                      <td className="py-2 px-3 font-mono font-semibold text-slate-250">
+                        {(metric.recall * 100).toFixed(1)}%
+                      </td>
+                      <td className="py-2 px-3 font-mono font-semibold text-slate-250">
+                        {(metric.f1_score * 100).toFixed(1)}%
+                      </td>
+                      <td className="py-2 px-3 text-slate-400 font-mono text-[11px]">
+                        {metric.total_samples}
+                      </td>
+                      <td className="py-2 px-3">
+                        <div className="flex flex-wrap gap-1 max-w-xs">
+                          {Array.isArray(metric.features_used) && metric.features_used.map((feat: string, idx: number) => (
+                            <span key={idx} className="bg-terminal-bg px-1.5 py-0.5 rounded text-[8px] border border-terminal-border/60 text-slate-450 uppercase font-sans">
+                              {feat}
+                            </span>
+                          ))}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* 4. Stock Detail Modal (Explainable AI reasoning) */}
       {selectedTicker && (
@@ -1268,6 +2615,27 @@ export default function TerminalDashboard() {
                     </div>
                   </div>
 
+                  {/* AI sentiment summary */}
+                  <div className="bg-terminal-bg/50 border border-terminal-border/80 p-3 rounded shadow-md">
+                    <h4 className="text-[10px] font-black uppercase text-terminal-accent tracking-wider mb-1 flex items-center gap-1.5">
+                      🤖 Sintesi Sentiment (AI locale)
+                    </h4>
+                    {llmSummaryLoading ? (
+                      <div className="text-[10px] text-terminal-muted flex items-center gap-1.5 py-1">
+                        <RefreshCw className="h-3 w-3 animate-spin text-terminal-accent" />
+                        <span>Generazione analisi in corso da Ollama locale...</span>
+                      </div>
+                    ) : llmSummary ? (
+                      <p className="text-[10px] text-slate-350 leading-relaxed font-mono whitespace-pre-wrap">
+                        {llmSummary}
+                      </p>
+                    ) : (
+                      <p className="text-[10px] text-terminal-muted italic">
+                        Nessuna sintesi generata o Ollama non raggiungibile.
+                      </p>
+                    )}
+                  </div>
+
                   {/* News list mapped to this stock */}
                   <div>
                     <h4 className="text-[10px] font-black uppercase text-slate-400 tracking-wider mb-2">
@@ -1349,7 +2717,7 @@ export default function TerminalDashboard() {
                       </h4>
                     </div>
 
-                    <div className="grid grid-cols-4 gap-2 text-center text-[10px]">
+                    <div className="grid grid-cols-5 gap-2 text-center text-[10px]">
                       <div className="bg-terminal-card border border-terminal-border p-1.5 rounded">
                         <span className="text-[8px] text-terminal-muted block uppercase">MT5 Symbol</span>
                         <span className="font-mono text-[10px] font-black text-white">{stockDetail.mt5_symbol}</span>
@@ -1359,6 +2727,12 @@ export default function TerminalDashboard() {
                         <span className={`font-mono text-[10px] font-black uppercase ${
                           stockDetail.signal === "BUY" ? "text-emerald-400" : stockDetail.signal === "SELL" ? "text-rose-400" : "text-slate-400"
                         }`}>{stockDetail.signal}</span>
+                      </div>
+                      <div className="bg-terminal-card border border-terminal-border p-1.5 rounded">
+                        <span className="text-[8px] text-terminal-muted block uppercase">ML Confidenza</span>
+                        <span className="font-mono text-[10px] font-black text-slate-200">
+                          🧠 {stockDetail.ml_prediction_prob ? `${(stockDetail.ml_prediction_prob * 100).toFixed(0)}%` : "50%"}
+                        </span>
                       </div>
                       <div className="bg-terminal-card border border-terminal-border p-1.5 rounded">
                         <span className="text-[8px] text-terminal-muted block uppercase">Stop Loss (SL)</span>
@@ -1455,13 +2829,22 @@ if (res > 0) {
                           Quantitative Backtest Simulator (RSI + Sentiment)
                         </h4>
                       </div>
-                      <button
-                        onClick={runBacktest}
-                        disabled={backtestLoading}
-                        className="bg-terminal-accent text-black px-3 py-1 text-[9px] font-black uppercase rounded hover:bg-white transition disabled:opacity-50"
-                      >
-                        {backtestLoading ? "Simulazione..." : "Esegui Backtest"}
-                      </button>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={optimizeParameters}
+                          disabled={optimizationLoading || !selectedTicker}
+                          className="border border-terminal-accent text-terminal-accent hover:bg-terminal-accent hover:text-black px-2 py-1 text-[9px] font-black uppercase rounded transition disabled:opacity-50"
+                        >
+                          {optimizationLoading ? "Calcolo..." : "💡 Ottimizza"}
+                        </button>
+                        <button
+                          onClick={runBacktest}
+                          disabled={backtestLoading}
+                          className="bg-terminal-accent text-black px-3 py-1 text-[9px] font-black uppercase rounded hover:bg-white transition disabled:opacity-50"
+                        >
+                          {backtestLoading ? "Simulazione..." : "Esegui Backtest"}
+                        </button>
+                      </div>
                     </div>
 
                     {/* Params grid */}
@@ -1505,6 +2888,47 @@ if (res > 0) {
                         />
                       </div>
                     </div>
+
+                    {/* Optimization results grid */}
+                    {optimizationResults && optimizationResults.top_configs && (
+                      <div className="bg-terminal-card border border-terminal-border/60 p-2.5 rounded text-[10px] space-y-2">
+                        <div className="flex justify-between items-center border-b border-terminal-border/30 pb-1">
+                          <span className="font-bold text-terminal-accent uppercase text-[9px]">💡 Top 3 Configs Ottimizzate ({optimizationResults.ticker})</span>
+                          <button
+                            onClick={() => setOptimizationResults(null)}
+                            className="text-slate-400 hover:text-white text-[8px]"
+                          >
+                            Chiudi
+                          </button>
+                        </div>
+                        <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                          {optimizationResults.top_configs.map((config: any, index: number) => (
+                            <div key={index} className="flex items-center justify-between p-1.5 bg-terminal-bg/40 rounded border border-terminal-border/20">
+                              <div className="flex flex-col gap-0.5 text-left">
+                                <div className="font-semibold text-slate-300">
+                                  Config #{index + 1}: Sharpe {config.sharpe_ratio.toFixed(2)} | Ritorno {config.total_return >= 0 ? "+" : ""}{config.total_return}%
+                                </div>
+                                <div className="text-[8px] text-terminal-muted">
+                                  RSI: {config.buy_rsi}/{config.sell_rsi} | Sent: {config.buy_sentiment}/{config.sell_sentiment} | Max DD: -{config.max_drawdown}%
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => {
+                                  setBacktestBuyRsi(config.buy_rsi);
+                                  setBacktestSellRsi(config.sell_rsi);
+                                  setBacktestBuySent(config.buy_sentiment);
+                                  setBacktestSellSent(config.sell_sentiment);
+                                  setOptimizationResults(null);
+                                }}
+                                className="bg-slate-800 hover:bg-terminal-accent hover:text-black px-2 py-0.5 text-[8px] font-bold uppercase rounded transition text-white"
+                              >
+                                Applica
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
 
                     {/* Simulation Results */}
                     {backtestResults && (
@@ -1763,6 +3187,50 @@ if (res > 0) {
                     {currentDrawdownPercent > maxDrawdownPercent || emergencyKillSwitch ? "BLOCCO (CLOSE_ALL)" : "REGOLARE"}
                   </span>
                 </div>
+              </div>
+
+              {/* Individual Account Risk Controls */}
+              <div className="space-y-2 border-t border-terminal-border/40 pt-4">
+                <label className="text-[10px] text-slate-400 font-bold uppercase block">
+                  Limiti Drawdown per Account MT5
+                </label>
+                {riskAccounts.length === 0 ? (
+                  <div className="text-[10px] text-terminal-muted italic py-1">Nessun account MT5 connesso</div>
+                ) : (
+                  <div className="space-y-3 max-h-40 overflow-y-auto pr-1">
+                    {riskAccounts.map((acc) => (
+                      <div key={acc.account_id} className="flex flex-col gap-1.5 p-2 bg-terminal-bg/30 border border-terminal-border/20 rounded">
+                        <div className="flex justify-between items-center text-[10px]">
+                          <span className="font-bold text-slate-300">ID: {acc.account_id} ({acc.broker})</span>
+                          <span className={`font-mono font-bold ${acc.current_drawdown_percent > acc.max_drawdown_percent ? "text-rose-400" : "text-emerald-400"}`}>
+                            DD: {acc.current_drawdown_percent}%
+                          </span>
+                        </div>
+                        <div className="flex gap-2 items-center">
+                          <input
+                            type="number"
+                            step="0.1"
+                            min="0.5"
+                            max="50.0"
+                            defaultValue={acc.max_drawdown_percent}
+                            id={`limit-${acc.account_id}`}
+                            className="w-20 bg-terminal-bg border border-terminal-border rounded px-2 py-1 text-[10px] text-white font-mono focus:border-terminal-accent focus:outline-none"
+                          />
+                          <span className="text-[10px] text-slate-400 font-bold font-mono">%</span>
+                          <button
+                            onClick={() => {
+                              const el = document.getElementById(`limit-${acc.account_id}`) as HTMLInputElement;
+                              if (el) saveAccountRisk(acc.account_id, Number(el.value));
+                            }}
+                            className="ml-auto bg-slate-800 hover:bg-terminal-accent hover:text-black px-2 py-1 text-[8px] font-bold uppercase rounded transition text-white"
+                          >
+                            Salva
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
             

@@ -9,3 +9,9 @@ venv/
 *.sqlite3
 *.log
 docker-compose.override.yml
+node_modules/
+.next/
+out/
+build/
+.DS_Store
+*.sh.old

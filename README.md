@@ -59,6 +59,26 @@ Centralized risk features protect capital from market anomalies:
 *   **Suffix Handling**: Resolves broker suffix conventions dynamically (e.g. `ENI.CP` for Capital Point Trading Ltd) inside the EA, matching assets cleanly back to the database ticker.
 *   **Dynamic Spread Control**: Orders are skipped if the broker spread exceeds the maximum threshold, dynamically configured as a percentage of the ask price (`InpMaxSpreadPercent`) or static point limits (`InpMaxSpreadPoints`).
 
+### 6. Multi-Mode Dynamic Position Sizing & Position Management
+Expert Advisors support three advanced position-sizing options and dynamic position management:
+*   **Moltiplicatore Lotto Minimo (`SIZING_MIN_LOT_MULTIPLIER`)**: Trades a fixed lot calculated as `SYMBOL_VOLUME_MIN` multiplied by `InpLotMultiplier` and adjusted by volatility.
+*   **Percentuale Rischio (`SIZING_RISK_PERCENT`)**: Dynamically risks a fixed % of account balance per trade (`InpRiskPercent`) calculated based on the distance to the ATR Stop Loss.
+*   **Percentuale Margine (`SIZING_MARGIN_PERCENT`)**: Restricts the trade size to allocate a fixed % of account balance (`InpMarginPercent`) as margin.
+*   **TP1 Partial Close & Break-Even SL**: If `InpEnablePartialClose` is active, when the price reaches the entry price plus/minus the target distance (`InpPartialCloseAtrMultiplier * SL`), the EA closes 50% of the volume (normalized to the symbol step) and moves the Stop Loss to break-even (entry price).
+
+### 7. Compliance Audit Log (Security Trail)
+An immutable ledger tracking security-critical events:
+*   **User Action Logging**: Stores login success/failure, administrative overrides, VSTOXX threshold changes, and manual signal execution.
+*   **SQL Persistence**: Saved in PostgreSQL table `audit_log` with IP addresses, timestamps, and JSON-formatted modification payloads.
+*   **Web Console**: Accessible via the `🔐 Compliance Audit` tab in the web terminal for administrators.
+
+### 8. AI/ML Engine & Online Walk-Forward Retraining
+The price direction forecasting classifier is subject to continuous assessment:
+*   **Walk-Forward Metrics**: Automatically calculates test accuracy, precision, recall, and f1-score (80% train / 20% test split) during each training.
+*   **Metrics Database**: Persisted in `ml_model_metrics` for monitoring historical performance.
+*   **Telegram & Discord Alerts**: Real-time webhook notifications are sent automatically to Discord and Telegram channels on settings updates, safeguard triggers, or manual overrides.
+*   **Web Control Panel**: The `🧠 AI/ML Engine` dashboard lists walk-forward metrics ticker-by-ticker, including visual color-coded accuracy bars and a button to trigger model retraining.
+
 ---
 
 ## 🚀 Getting Started
@@ -159,6 +179,15 @@ To connect MetaTrader 5 to your local EuroQuant server:
           "action": "BUY" // BUY, SELL, HOLD, or CLEAR
         }
         ```
+
+### Compliance & AI/ML Control
+*   **`GET /api/audit-log`**
+    *   **Description**: Retrieves recent administrative and risk override audit trail logs.
+    *   **Parameters**: `limit` (integer, default `100`)
+*   **`GET /api/ml/metrics`**
+    *   **Description**: Returns walk-forward validation accuracy and statistics for all trained models.
+*   **`POST /api/ml/retrain`**
+    *   **Description**: Triggers a background thread to initiate online model retraining across all symbol companies.
 
 ---
 

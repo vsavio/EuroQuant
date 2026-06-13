@@ -10,13 +10,17 @@ LOOP_INTERVAL_HOURS = float(os.getenv("LOOP_INTERVAL_HOURS", "2"))
 # Volatility warning threshold
 V2TX_THRESHOLD = 30.0
 
-# European Indices to track
+# European and Global Indices to track
 INDICES = {
     "^STOXX": "STOXX Europe 600",
     "^GDAXI": "DAX 40",
     "^FCHI": "CAC 40",
     "FTSEMIB.MI": "FTSE MIB",
-    "^IBEX": "IBEX 35"
+    "^IBEX": "IBEX 35",
+    "^GSPC": "S&P 500",
+    "^IXIC": "NASDAQ Composite",
+    "^N225": "Nikkei 225",
+    "^HSI": "Hang Seng Index"
 }
 
 # Source trust scores (Professional Enhancement #2)
@@ -51,5 +55,16 @@ SOURCE_TRUST_SCORES = {
     "The Times Business": 0.80,
     "The Guardian Business": 0.80,
     "BBC Business": 0.80,
-    "Investir Les Echos": 0.80
+    "Investir Les Echos": 0.80,
+    # USA
+    "CNBC Finance": 0.90,
+    "Bloomberg Markets": 0.90,
+    "WSJ Markets": 0.90,
+    "MarketWatch Market": 0.85,
+    "Yahoo Finance": 0.80,
+    # Asia
+    "Nikkei Asia": 0.85,
+    "SCMP Business": 0.80,
+    "Caixin Global": 0.80,
+    "Channel NewsAsia Business": 0.80
 }

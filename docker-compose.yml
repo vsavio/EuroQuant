@@ -5,17 +5,18 @@ services:
     image: postgres:15-alpine
     container_name: euroquant_db
     restart: unless-stopped
+    env_file: .env
     environment:
-      POSTGRES_USER: euroquant_user
-      POSTGRES_PASSWORD: euroquant_password
-      POSTGRES_DB: euroquant_db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U euroquant_user -d euroquant_db" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -24,29 +25,40 @@ services:
     build: ./backend
     container_name: euroquant_backend
     restart: unless-stopped
+    env_file: .env
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://euroquant_user:euroquant_password@db:5432/euroquant_db
-      - OLLAMA_HOST=http://host.docker.internal:11434
+      - DATABASE_URL=${DATABASE_URL}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - OLLAMA_HOST=${OLLAMA_HOST}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
       - PYTHONUNBUFFERED=1
     depends_on:
       db:
         condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   worker:
     build: ./worker
     container_name: euroquant_worker
     restart: unless-stopped
+    env_file: .env
     environment:
-      - DATABASE_URL=postgresql://euroquant_user:euroquant_password@db:5432/euroquant_db
-      - OLLAMA_HOST=http://host.docker.internal:11434
-      - RUN_ONCE_AND_LOOP=true
-      - LOOP_INTERVAL_HOURS=1
+      - DATABASE_URL=${DATABASE_URL}
+      - OLLAMA_HOST=${OLLAMA_HOST}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - RUN_ONCE_AND_LOOP=${RUN_ONCE_AND_LOOP:-true}
+      - LOOP_INTERVAL_HOURS=${LOOP_INTERVAL_HOURS:-1}
       - PYTHONUNBUFFERED=1
-      - DISABLE_FINBERT=true
+      - DISABLE_FINBERT=${DISABLE_FINBERT:-true}
     depends_on:
       db:
         condition: service_healthy
@@ -57,12 +69,32 @@ services:
     build: ./frontend
     container_name: euroquant_frontend
     restart: unless-stopped
-    ports:
-      - "3000:3000"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
     environment:
-      - NEXT_PUBLIC_API_URL=http://localhost:8000
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
     depends_on:
+      backend:
+        condition: service_healthy
+
+  nginx:
+    image: nginx:alpine
+    container_name: euroquant_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "3000:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
       - backend
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   pgdata:

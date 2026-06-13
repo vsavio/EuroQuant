@@ -1,11 +1,75 @@
 import time
 import sys
+import json
+from datetime import datetime, timezone
+
+class StdoutJsonLogger:
+    def __init__(self, original_stream, level="INFO"):
+        self.original_stream = original_stream
+        self.level = level
+
+    def write(self, message):
+        stripped = message.strip()
+        if stripped:
+            log_data = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "level": self.level,
+                "message": stripped
+            }
+            self.original_stream.write(json.dumps(log_data) + "\n")
+            self.original_stream.flush()
+
+    def flush(self):
+        self.original_stream.flush()
+
+sys.stdout = StdoutJsonLogger(sys.stdout, "INFO")
+sys.stderr = StdoutJsonLogger(sys.stderr, "ERROR")
 from database import init_db_connection
 from scraper import scrape_feeds
 from nlp import process_unprocessed_news
 from quant import fetch_and_calculate_all
 from recommender import generate_recommendations
 from config import RUN_ONCE_AND_LOOP, LOOP_INTERVAL_HOURS
+
+def archive_historical_data():
+    print("Running database archiving routine...")
+    from database import SessionLocal
+    from sqlalchemy import text
+    db = SessionLocal()
+    try:
+        # Archive stock prices older than 90 days
+        db.execute(text("""
+            INSERT INTO stock_prices_archive (ticker, timestamp, open, high, low, close, volume, rsi, macd, macd_signal, sma_20, sma_50, sma_200, adx, atr)
+            SELECT ticker, timestamp, open, high, low, close, volume, rsi, macd, macd_signal, sma_20, sma_50, sma_200, adx, atr
+            FROM stock_prices
+            WHERE timestamp < NOW() - INTERVAL '90 days'
+            ON CONFLICT DO NOTHING
+        """))
+        deleted_prices = db.execute(text("""
+            DELETE FROM stock_prices
+            WHERE timestamp < NOW() - INTERVAL '90 days'
+        """)).rowcount
+        
+        # Archive news articles older than 90 days
+        db.execute(text("""
+            INSERT INTO news_articles_archive (id, title, content, url, source, published_date, country, sentiment_score, sentiment_label, processed, parent_article_id)
+            SELECT id, title, content, url, source, published_date, country, sentiment_score, sentiment_label, processed, parent_article_id
+            FROM news_articles
+            WHERE published_date < NOW() - INTERVAL '90 days'
+            ON CONFLICT (id) DO NOTHING
+        """))
+        deleted_news = db.execute(text("""
+            DELETE FROM news_articles
+            WHERE published_date < NOW() - INTERVAL '90 days'
+        """)).rowcount
+        
+        db.commit()
+        print(f"Archived and cleaned up {deleted_prices} price rows and {deleted_news} news rows.")
+    except Exception as e:
+        print(f"Error during database archiving: {e}")
+        db.rollback()
+    finally:
+        db.close()
 
 def run_pipeline():
     print("=========================================")
@@ -36,6 +100,12 @@ def run_pipeline():
     except Exception as e:
         print(f"Pipeline Error in Recommender Engine: {e}")
         
+    # 5. Archive historical data
+    try:
+        archive_historical_data()
+    except Exception as e:
+        print(f"Pipeline Error in Database Archiver: {e}")
+        
     print("=========================================")
     print(f"Pipeline Execution Completed: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=========================================\n")
@@ -59,7 +129,41 @@ def main():
     from database import SessionLocal
     
     db = SessionLocal()
+    # Run migrations to support high nominal value stocks (KRW / JPY)
+    migrations = [
+        "ALTER TABLE stock_prices ALTER COLUMN macd TYPE NUMERIC(15,4)",
+        "ALTER TABLE stock_prices ALTER COLUMN macd_signal TYPE NUMERIC(15,4)",
+        "ALTER TABLE stock_prices ALTER COLUMN adx TYPE NUMERIC(15,4)",
+        "ALTER TABLE stock_prices_archive ALTER COLUMN macd TYPE NUMERIC(15,4)",
+        "ALTER TABLE stock_prices_archive ALTER COLUMN macd_signal TYPE NUMERIC(15,4)",
+        "ALTER TABLE stock_prices_archive ALTER COLUMN adx TYPE NUMERIC(15,4)",
+        "ALTER TABLE recommendations ALTER COLUMN price_change_24h TYPE NUMERIC(15,4)",
+        "ALTER TABLE recommendations ALTER COLUMN adx TYPE NUMERIC(15,4)",
+        "ALTER TABLE recommendations ALTER COLUMN volatility_lot_sizing TYPE NUMERIC(15,4)",
+        "ALTER TABLE recommendation_history ALTER COLUMN price_change_24h TYPE NUMERIC(15,4)",
+        "ALTER TABLE recommendation_history ALTER COLUMN adx TYPE NUMERIC(15,4)",
+        "ALTER TABLE recommendation_history ALTER COLUMN volatility_lot_sizing TYPE NUMERIC(15,4)"
+    ]
+    for mig in migrations:
+        try:
+            db.execute(text(mig))
+            db.commit()
+        except Exception:
+            db.rollback()
+
     try:
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS system_settings (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                telegram_bot_token VARCHAR(255) DEFAULT '',
+                telegram_chat_id VARCHAR(50) DEFAULT '',
+                discord_webhook_url TEXT DEFAULT '',
+                CONSTRAINT single_row CHECK (id = 1)
+            )
+        """))
+        db.execute(text("""
+            INSERT INTO system_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
+        """))
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS job_queue (
                 id SERIAL PRIMARY KEY,
@@ -67,16 +171,53 @@ def main():
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             )
         """))
-        db.execute(text("ALTER TABLE stock_prices ADD COLUMN IF NOT EXISTS adx NUMERIC(8,4)"))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS stock_prices_archive (
+                id SERIAL PRIMARY KEY,
+                ticker VARCHAR(20) NOT NULL,
+                timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+                open NUMERIC(15, 4),
+                high NUMERIC(15, 4),
+                low NUMERIC(15, 4),
+                close NUMERIC(15, 4),
+                volume BIGINT,
+                rsi NUMERIC(8, 4),
+                macd NUMERIC(15, 4),
+                macd_signal NUMERIC(15, 4),
+                sma_20 NUMERIC(15, 4),
+                sma_50 NUMERIC(15, 4),
+                sma_200 NUMERIC(15, 4),
+                adx NUMERIC(15, 4),
+                atr NUMERIC(15, 4),
+                archived_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+        """))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS news_articles_archive (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT,
+                url TEXT NOT NULL,
+                source VARCHAR(100) NOT NULL,
+                published_date TIMESTAMP WITH TIME ZONE NOT NULL,
+                country VARCHAR(50) NOT NULL,
+                sentiment_score NUMERIC(5, 4),
+                sentiment_label VARCHAR(20),
+                processed BOOLEAN DEFAULT FALSE,
+                parent_article_id INTEGER,
+                archived_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+        """))
+        db.execute(text("ALTER TABLE stock_prices ADD COLUMN IF NOT EXISTS adx NUMERIC(15,4)"))
         db.execute(text("ALTER TABLE stock_prices ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
         
-        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS adx NUMERIC(8,4)"))
+        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS adx NUMERIC(15,4)"))
         db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
-        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS volatility_lot_sizing NUMERIC(8,4)"))
+        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS volatility_lot_sizing NUMERIC(15,4)"))
         
-        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS adx NUMERIC(8,4)"))
+        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS adx NUMERIC(15,4)"))
         db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
-        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS volatility_lot_sizing NUMERIC(8,4)"))
+        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS volatility_lot_sizing NUMERIC(15,4)"))
         
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS recommendation_history (
@@ -85,7 +226,7 @@ def main():
                 timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                 signal VARCHAR(20) NOT NULL,
                 sentiment_score NUMERIC(5, 4),
-                price_change_24h NUMERIC(8, 4),
+                price_change_24h NUMERIC(15, 4),
                 reason_technical TEXT
             )
         """))
@@ -99,6 +240,14 @@ def main():
             ON CONFLICT (ticker) DO NOTHING
         """))
         db.commit()
+
+        # Seed global markets (USA & Asia)
+        try:
+            from seed_global import seed_global_data
+            seed_global_data()
+        except Exception as seed_err:
+            print(f"Error executing global seeding: {seed_err}")
+
     except Exception as e:
         print(f"Error executing db initialization: {e}")
         db.rollback()

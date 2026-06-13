@@ -1,4 +1,25 @@
--- Create tables for EuroQuant Framework
+CREATE TABLE IF NOT EXISTS system_settings (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    telegram_bot_token VARCHAR(255) DEFAULT '',
+    telegram_chat_id VARCHAR(50) DEFAULT '',
+    discord_webhook_url TEXT DEFAULT '',
+    CONSTRAINT single_row CHECK (id = 1)
+);
+INSERT INTO system_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
+
+-- Audit log: tracks all security-critical and administrative actions
+CREATE TABLE IF NOT EXISTS audit_log (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(100) NOT NULL,
+    action VARCHAR(100) NOT NULL,
+    details JSONB DEFAULT '{}',
+    ip_address VARCHAR(50) DEFAULT 'unknown',
+    timestamp TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_username ON audit_log (username);
+CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log (timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log (action);
+
 
 CREATE TABLE IF NOT EXISTS companies (
     ticker VARCHAR(20) PRIMARY KEY,
@@ -19,8 +40,8 @@ CREATE TABLE IF NOT EXISTS stock_prices (
     close NUMERIC(15, 4),
     volume BIGINT,
     rsi NUMERIC(8, 4),
-    macd NUMERIC(8, 4),
-    macd_signal NUMERIC(8, 4),
+    macd NUMERIC(15, 4),
+    macd_signal NUMERIC(15, 4),
     sma_20 NUMERIC(15, 4),
     sma_50 NUMERIC(15, 4),
     sma_200 NUMERIC(15, 4),
@@ -51,7 +72,7 @@ CREATE TABLE IF NOT EXISTS recommendations (
     timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
     signal VARCHAR(20) NOT NULL, -- STRONG BUY, BUY, HOLD, SELL, STRONG SELL
     sentiment_score NUMERIC(5, 4),
-    price_change_24h NUMERIC(8, 4),
+    price_change_24h NUMERIC(15, 4),
     reason_macro TEXT,
     reason_micro TEXT,
     reason_technical TEXT,
@@ -183,3 +204,77 @@ ON CONFLICT (feed_url) DO UPDATE SET
     source_name = EXCLUDED.source_name,
     country = EXCLUDED.country,
     trust_score = EXCLUDED.trust_score;
+
+-- Seed US and Asian companies data
+INSERT INTO companies (ticker, name, country, sector, industry, trust_score) VALUES
+-- USA
+('AAPL', 'Apple Inc.', 'USA', 'Technology', 'Consumer Electronics', 0.95),
+('MSFT', 'Microsoft Corporation', 'USA', 'Technology', 'Software - Infrastructure', 0.95),
+('AMZN', 'Amazon.com, Inc.', 'USA', 'Consumer Cyclical', 'Internet Retail', 0.90),
+('NVDA', 'NVIDIA Corporation', 'USA', 'Technology', 'Semiconductors', 0.95),
+('GOOGL', 'Alphabet Inc.', 'USA', 'Technology', 'Internet Content & Information', 0.90),
+('TSLA', 'Tesla, Inc.', 'USA', 'Consumer Cyclical', 'Auto Manufacturers', 0.90),
+('META', 'Meta Platforms, Inc.', 'USA', 'Technology', 'Internet Content & Information', 0.85),
+('JPM', 'JPMorgan Chase & Co.', 'USA', 'Financial Services', 'Banks - Diversified', 0.90),
+('V', 'Visa Inc.', 'USA', 'Financial Services', 'Credit Services', 0.90),
+('LLY', 'Eli Lilly and Company', 'USA', 'Healthcare', 'Drug Manufacturers - General', 0.90),
+-- Japan
+('7203.T', 'Toyota Motor Corporation', 'Japan', 'Consumer Cyclical', 'Auto Manufacturers', 0.85),
+('9984.T', 'SoftBank Group Corp.', 'Japan', 'Technology', 'Telecom Services', 0.80),
+('6758.T', 'Sony Group Corporation', 'Japan', 'Consumer Cyclical', 'Consumer Electronics', 0.85),
+-- Hong Kong
+('0700.HK', 'Tencent Holdings Limited', 'Hong Kong', 'Technology', 'Internet Content & Information', 0.85),
+('9988.HK', 'Alibaba Group Holding Limited', 'Hong Kong', 'Consumer Cyclical', 'Internet Retail', 0.80),
+('1211.HK', 'BYD Company Limited', 'Hong Kong', 'Consumer Cyclical', 'Auto Manufacturers', 0.80),
+-- Taiwan
+('2330.TW', 'Taiwan Semiconductor Manufacturing Co.', 'Taiwan', 'Technology', 'Semiconductors', 0.95),
+-- South Korea
+('005930.KS', 'Samsung Electronics Co., Ltd.', 'South Korea', 'Technology', 'Consumer Electronics', 0.90),
+-- Crypto
+('BTC-USD', 'Bitcoin', 'Crypto', 'Crypto', 'Cryptocurrency', 0.95),
+('ETH-USD', 'Ethereum', 'Crypto', 'Crypto', 'Cryptocurrency', 0.90),
+('XRP-USD', 'Ripple', 'Crypto', 'Crypto', 'Cryptocurrency', 0.85),
+('SOL-USD', 'Solana', 'Crypto', 'Crypto', 'Cryptocurrency', 0.85),
+('ADA-USD', 'Cardano', 'Crypto', 'Crypto', 'Cryptocurrency', 0.80),
+('DOT-USD', 'Polkadot', 'Crypto', 'Crypto', 'Cryptocurrency', 0.80)
+ON CONFLICT (ticker) DO UPDATE SET
+    name = EXCLUDED.name,
+    country = EXCLUDED.country,
+    sector = EXCLUDED.sector,
+    industry = EXCLUDED.industry,
+    trust_score = EXCLUDED.trust_score;
+
+-- Seed US and Asian RSS feeds
+INSERT INTO rss_feeds (source_name, feed_url, country, trust_score) VALUES
+-- USA
+('CNBC Finance', 'https://search.cnbc.com/rs/search/all/view.xml?partnerId=2000&keywords=finance', 'USA', 0.90),
+('Bloomberg Markets', 'https://www.bloomberg.com/feeds/bpol/markets.xml', 'USA', 0.90),
+('WSJ Markets', 'https://feeds.a.dj.com/rss/RSSMarketsMain.xml', 'USA', 0.90),
+('MarketWatch Market', 'https://feeds.content.marketwatch.com/marketwatch/rss/marketalerts', 'USA', 0.85),
+('Yahoo Finance', 'https://finance.yahoo.com/news/rssindex', 'USA', 0.80),
+-- Asia
+('Nikkei Asia', 'https://asia.nikkei.com/rss/feed/nar', 'Japan', 0.85),
+('SCMP Business', 'https://www.scmp.com/rss/92/feed.xml', 'Hong Kong', 0.80),
+('Caixin Global', 'https://www.caixinglobal.com/rss/', 'China', 0.80),
+('Channel NewsAsia Business', 'https://www.channelnewsasia.com/api/v1/rss-outbound-feed?category=6911', 'Singapore', 0.80),
+-- Crypto
+('CoinDesk Feed', 'https://www.coindesk.com/arc/outboundfeeds/rss/', 'Crypto', 0.85),
+('Cointelegraph Feed', 'https://cointelegraph.com/rss', 'Crypto', 0.85),
+('Decrypt Feed', 'https://decrypt.co/feed', 'Crypto', 0.80)
+ON CONFLICT (feed_url) DO UPDATE SET
+    source_name = EXCLUDED.source_name,
+    country = EXCLUDED.country,
+    trust_score = EXCLUDED.trust_score;
+
+-- ML model metrics table to track performance statistics and check drift
+CREATE TABLE IF NOT EXISTS ml_model_metrics (
+    ticker VARCHAR(20) PRIMARY KEY REFERENCES companies(ticker) ON DELETE CASCADE,
+    last_trained TIMESTAMPTZ DEFAULT NOW(),
+    accuracy NUMERIC(5, 4),
+    precision NUMERIC(5, 4),
+    recall NUMERIC(5, 4),
+    f1_score NUMERIC(5, 4),
+    total_samples INTEGER,
+    features_used JSONB DEFAULT '[]'
+);
+
