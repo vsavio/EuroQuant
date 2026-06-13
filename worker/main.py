@@ -76,6 +76,13 @@ def run_pipeline():
     print(f"Pipeline Execution Triggered: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=========================================")
     
+    # 0. Scrape Economic Calendar
+    try:
+        from calendar_scraper import scrape_economic_calendar
+        scrape_economic_calendar()
+    except Exception as e:
+        print(f"Pipeline Error in Economic Calendar Scraper: {e}")
+
     # 1. Scrape News
     try:
         scrape_feeds()
@@ -93,6 +100,13 @@ def run_pipeline():
         fetch_and_calculate_all()
     except Exception as e:
         print(f"Pipeline Error in Quantitative Engine: {e}")
+
+    # 3b. Classify Market Regimes
+    try:
+        from regimes import classify_market_regimes
+        classify_market_regimes()
+    except Exception as e:
+        print(f"Pipeline Error in Regime Classifier: {e}")
         
     # 4. Generate Recommendations (LLM)
     try:

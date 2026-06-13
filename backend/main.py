@@ -1218,6 +1218,8 @@ class MT5Signal(BaseModel):
     adx: Optional[float] = None
     atr: Optional[float] = None
     volatility_lot_sizing: Optional[float] = 1.0
+    kelly_factor: Optional[float] = 1.0
+    regime: Optional[str] = "REGIME_MEAN_REVERTING"
 
 @app.get("/api/mt5/signals")
 async def get_mt5_signals(
@@ -1362,12 +1364,39 @@ async def get_mt5_signals(
                 f"Status: Normal trading resumed."
             )
 
+        # Check macroeconomic news freeze zone (impact = 'High' within +/- 15 minutes)
+        now_utc = datetime.now(timezone.utc)
+        news_freeze = False
+        news_event_title = ""
+        try:
+            news_row = conn.execute(
+                text("""
+                    SELECT title, country, scheduled_time 
+                    FROM economic_calendar 
+                    WHERE scheduled_time >= :start AND scheduled_time <= :end 
+                      AND impact = 'High'
+                    LIMIT 1
+                """),
+                {
+                    "start": now_utc - timedelta(minutes=15),
+                    "end": now_utc + timedelta(minutes=15)
+                }
+            ).fetchone()
+            if news_row:
+                news_freeze = True
+                news_event_title = f"{news_row[0]} ({news_row[1]}) alle {news_row[2].strftime('%H:%M')} UTC"
+        except Exception as ex:
+            print(f"Error checking news freeze zone: {ex}")
+
         signals = []
         for r_ticker, r_signal, r_reason, r_price, r_gen, r_adx, r_atr, r_vol in rows:
             # Check for manual overrides or risk trigger
             if is_risk_triggered:
                 active_signal = "CLOSE_ALL"
                 active_reason = f"RISCHIO ATTIVATO: {risk_reason}"
+            elif news_freeze and r_signal not in ["CLOSE_ALL", "HOLD"]:
+                active_signal = "HOLD"
+                active_reason = f"CONGELAMENTO OPERATIVO: Notizia Macroeconomica Imminente: {news_event_title}"
             else:
                 active_signal = r_signal
                 active_reason = r_reason
@@ -1388,6 +1417,33 @@ async def get_mt5_signals(
                     active_signal = manual_overrides[override_key]["action"]
                     active_reason = f"OVERRIDE MANUALE DALLA DASHBOARD WEB ({manual_overrides[override_key]['timestamp']})"
 
+            # Fetch regime
+            regime = "REGIME_MEAN_REVERTING"
+            try:
+                regime_row = conn.execute(
+                    text("SELECT regime FROM market_regimes WHERE ticker = :ticker"),
+                    {"ticker": r_ticker}
+                ).fetchone()
+                if regime_row:
+                    regime = regime_row[0]
+            except Exception:
+                pass
+
+            # Calculate Kelly Factor
+            kelly_factor = 1.0
+            try:
+                metrics_row = conn.execute(
+                    text("SELECT accuracy FROM ml_model_metrics WHERE ticker = :ticker"),
+                    {"ticker": r_ticker}
+                ).fetchone()
+                if metrics_row and metrics_row[0] is not None:
+                    p = max(0.01, min(0.99, float(metrics_row[0])))
+                    b = 2.0  # Reward/Risk Ratio (TP ATR 3.0 / SL ATR 1.5)
+                    kelly_val = p - (1.0 - p) / b
+                    # Fractional Kelly (cap at 1.0, floor at 0.1)
+                    kelly_factor = max(0.1, min(1.0, kelly_val))
+            except Exception:
+                pass
 
             # Calculate ATR for SL/TP
             atr_prices = conn.execute(
@@ -1444,7 +1500,9 @@ async def get_mt5_signals(
                 timestamp=r_gen.strftime("%Y-%m-%d %H:%M:%S") + " Z" if r_gen else "",
                 adx=float(r_adx) if r_adx is not None else None,
                 atr=float(r_atr) if r_atr is not None else None,
-                volatility_lot_sizing=float(r_vol) if r_vol is not None else 1.0
+                volatility_lot_sizing=float(r_vol) if r_vol is not None else 1.0,
+                kelly_factor=kelly_factor,
+                regime=regime
             ))
             
         if ticker:
@@ -1831,6 +1889,65 @@ async def retrain_ml_models(request: Request, current_user: dict = Depends(requi
         f"ML model online retraining triggered by admin user: <b>{current_user['username']}</b>."
     )
     return {"status": "success", "message": "Retraining thread started successfully."}
+
+
+
+@app.get("/api/market-regimes")
+def get_market_regimes():
+    """Returns the classified market regimes for all tracked companies."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT ticker, regime, volatility_30d, atr_ratio, timestamp 
+                FROM market_regimes 
+                ORDER BY ticker ASC
+            """)
+        ).fetchall()
+    return [
+        {
+            "ticker": r[0],
+            "regime": r[1],
+            "volatility_30d": r[2],
+            "atr_ratio": r[3],
+            "timestamp": r[4].isoformat() if r[4] else None
+        }
+        for r in rows
+    ]
+
+@app.get("/api/economic-calendar")
+def get_economic_calendar(limit: int = 50):
+    """Returns upcoming macroeconomic events from the economic calendar."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT id, event_key, title, country, impact, scheduled_time, timestamp 
+                FROM economic_calendar 
+                ORDER BY scheduled_time DESC 
+                LIMIT :limit
+            """),
+            {"limit": limit}
+        ).fetchall()
+    return [
+        {
+            "id": r[0],
+            "event_key": r[1],
+            "title": r[2],
+            "country": r[3],
+            "impact": r[4],
+            "scheduled_time": r[5].isoformat() if r[5] else None,
+            "timestamp": r[6].isoformat() if r[6] else None
+        }
+        for r in rows
+    ]
+
+
+
+@app.get("/api/portfolio/weights")
+def get_portfolio_weights():
+    """Returns the optimized Markowitz portfolio weights."""
+    from portfolio_opt import get_optimized_portfolio_weights
+    weights = get_optimized_portfolio_weights()
+    return weights
 
 
 

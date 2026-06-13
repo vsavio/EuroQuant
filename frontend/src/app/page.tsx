@@ -4,7 +4,7 @@ import React, { useState, useEffect } from "react";
 import { 
   TrendingUp, TrendingDown, RefreshCw, AlertTriangle, 
   Search, ShieldAlert, Award, FileText, Globe, Cpu, X,
-  Activity, ArrowUpRight, Newspaper, Play
+  Activity, ArrowUpRight, Newspaper, Play, Calendar, Percent
 } from "lucide-react";
 import { 
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, 
@@ -294,6 +294,8 @@ export default function TerminalDashboard() {
   const [monteCarloLoading, setMonteCarloLoading] = useState(false);
   const [portfolioWeights, setPortfolioWeights] = useState<Record<string, number> | null>(null);
   const [portfolioWeightsLoading, setPortfolioWeightsLoading] = useState(false);
+  const [economicCalendar, setEconomicCalendar] = useState<any[]>([]);
+  const [marketRegimes, setMarketRegimes] = useState<any[]>([]);
   const [optMethod, setOptMethod] = useState<"max_sharpe" | "min_volatility">("max_sharpe");
   const [useBL, setUseBL] = useState(true);
   const [wfoResults, setWfoResults] = useState<any[]>([]);
@@ -418,6 +420,39 @@ export default function TerminalDashboard() {
       if (riskAnalyticsRes.ok) {
         const data = await riskAnalyticsRes.json();
         setRiskAnalytics(data);
+      }
+
+      // Fetch economic calendar
+      try {
+        const calendarRes = await fetch(`${API_URL}/api/economic-calendar`);
+        if (calendarRes.ok) {
+          const data = await calendarRes.json();
+          setEconomicCalendar(data);
+        }
+      } catch (err) {
+        console.error("Error fetching calendar:", err);
+      }
+
+      // Fetch market regimes
+      try {
+        const regimesRes = await fetch(`${API_URL}/api/market-regimes`);
+        if (regimesRes.ok) {
+          const data = await regimesRes.json();
+          setMarketRegimes(data);
+        }
+      } catch (err) {
+        console.error("Error fetching regimes:", err);
+      }
+
+      // Fetch portfolio weights
+      try {
+        const weightsRes = await fetch(`${API_URL}/api/portfolio/weights`);
+        if (weightsRes.ok) {
+          const data = await weightsRes.json();
+          setPortfolioWeights(data);
+        }
+      } catch (err) {
+        console.error("Error fetching portfolio weights:", err);
       }
     } catch (error) {
       console.error("Error fetching dashboard data:", error);
@@ -1486,6 +1521,96 @@ export default function TerminalDashboard() {
                       </div>
                     </div>
                   ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* D. Economic Calendar & News Freeze */}
+          <div className="bg-terminal-card border border-terminal-border p-3 rounded flex flex-col h-[220px] shrink-0 overflow-hidden">
+            <div className="flex items-center justify-between mb-1.5 border-b border-terminal-border pb-1.5">
+              <h2 className="text-[10px] font-black uppercase text-slate-400 flex items-center gap-1.5">
+                <Calendar className="h-3.5 w-3.5 text-terminal-accent" /> Economic Calendar (Freeze Zones)
+              </h2>
+              <span className="text-[8px] bg-slate-800 text-slate-400 font-mono px-1.5 py-0.2 rounded uppercase font-bold">
+                {economicCalendar.length} Events
+              </span>
+            </div>
+
+            <div className="overflow-y-auto flex-1 text-[10px] pr-1">
+              {economicCalendar.length === 0 ? (
+                <div className="h-full flex items-center justify-center text-terminal-muted">
+                  Nessun evento in calendario.
+                </div>
+              ) : (
+                <div className="divide-y divide-terminal-border/20">
+                  {economicCalendar.map((ev) => {
+                    const eventTime = new Date(ev.scheduled_time);
+                    const now = new Date();
+                    const diffMins = (eventTime.getTime() - now.getTime()) / (1000 * 60);
+                    const isFreezeActive = Math.abs(diffMins) <= 15;
+
+                    return (
+                      <div key={ev.id} className="py-1.5 flex flex-col gap-1">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-slate-200">{ev.title}</span>
+                          <span className={`text-[8px] px-1 py-0.2 rounded font-mono font-bold ${
+                            isFreezeActive ? "bg-rose-950 text-rose-400 border border-rose-500/30 animate-pulse" : "bg-slate-800 text-slate-400"
+                          }`}>
+                            {isFreezeActive ? "FREEZE ACTIVE" : "HIGH IMPACT"}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between text-[9px] text-terminal-muted">
+                          <span>Paese: <b className="text-slate-350">{ev.country}</b></span>
+                          <span>
+                            {eventTime.getUTCHours().toString().padStart(2, '0')}:
+                            {eventTime.getUTCMinutes().toString().padStart(2, '0')} UTC
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* E. Institutional Portfolio Allocation */}
+          <div className="bg-terminal-card border border-terminal-border p-3 rounded flex flex-col h-[220px] shrink-0 overflow-hidden">
+            <div className="flex items-center justify-between mb-1.5 border-b border-terminal-border pb-1.5">
+              <h2 className="text-[10px] font-black uppercase text-slate-400 flex items-center gap-1.5">
+                <Percent className="h-3.5 w-3.5 text-terminal-accent" /> Markowitz Portfolio Allocation
+              </h2>
+              <span className="text-[8px] bg-slate-800 text-slate-400 font-mono px-1.5 py-0.2 rounded uppercase font-bold">
+                Optimal weights
+              </span>
+            </div>
+
+            <div className="overflow-y-auto flex-1 text-[10px] pr-1">
+              {!portfolioWeights ? (
+                <div className="h-full flex items-center justify-center text-terminal-muted">
+                  Nessuna allocazione calcolata.
+                </div>
+              ) : (
+                <div className="divide-y divide-terminal-border/20">
+                  {Object.entries(portfolioWeights)
+                    .filter(([_, weight]) => weight > 0)
+                    .map(([ticker, weight]) => {
+                      const tickerRegime = marketRegimes.find(r => r.ticker === ticker);
+                      return (
+                        <div key={ticker} className="py-1.5 flex items-center justify-between">
+                          <div className="flex flex-col">
+                            <span className="font-bold text-slate-200">{ticker.split('.')[0]}</span>
+                            <span className="text-[8px] text-terminal-muted">
+                              Regime: {tickerRegime ? tickerRegime.regime.replace("REGIME_", "") : "UNKNOWN"}
+                            </span>
+                          </div>
+                          <div className="text-right">
+                            <span className="font-black text-terminal-accent font-mono">{(weight * 100).toFixed(2)}%</span>
+                          </div>
+                        </div>
+                      );
+                    })}
                 </div>
               )}
             </div>

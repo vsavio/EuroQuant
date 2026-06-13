@@ -11,7 +11,7 @@
 #      chmod +x push_to_github.sh
 #
 #   2. Esegui lo script passando il messaggio del commit:
-#      ./push_to_github.sh "Messaggio descrittivo delle modifiche"
+#      ./push_to_github.sh "Messaggio descrittivo delle modifiche" 
 # ==============================================================================
 
 # Ferma lo script in caso di errori

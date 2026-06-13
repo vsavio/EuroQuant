@@ -278,3 +278,24 @@ CREATE TABLE IF NOT EXISTS ml_model_metrics (
     features_used JSONB DEFAULT '[]'
 );
 
+-- Market regimes table
+CREATE TABLE IF NOT EXISTS market_regimes (
+    ticker VARCHAR(20) PRIMARY KEY REFERENCES companies(ticker) ON DELETE CASCADE,
+    regime VARCHAR(50) NOT NULL,
+    volatility_30d DOUBLE PRECISION NOT NULL,
+    atr_ratio DOUBLE PRECISION NOT NULL,
+    timestamp TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Economic calendar table
+CREATE TABLE IF NOT EXISTS economic_calendar (
+    id SERIAL PRIMARY KEY,
+    event_key VARCHAR(255) UNIQUE NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    country VARCHAR(50) NOT NULL,
+    impact VARCHAR(50) NOT NULL, -- High, Medium, Low
+    scheduled_time TIMESTAMPTZ NOT NULL,
+    timestamp TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_econ_calendar_time ON economic_calendar (scheduled_time DESC);
+

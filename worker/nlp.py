@@ -373,7 +373,9 @@ def process_unprocessed_news():
                 
                 # 2. Run Sentiment Analysis only if it maps to a target company
                 if tickers:
-                    if ollama_calls_made < max_ollama_calls:
+                    if load_finbert():
+                        label, score = analyze_sentiment(title, content)
+                    elif ollama_calls_made < max_ollama_calls:
                         label, score = analyze_sentiment(title, content)
                         ollama_calls_made += 1
                     else:
