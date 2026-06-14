@@ -3,6 +3,7 @@ import pandas as pd
 from sqlalchemy import text
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import RandomizedSearchCV
 
 # Minimum confidence to trust the model — below this threshold return neutral 0.50
 CONFIDENCE_THRESHOLD = 0.55
@@ -57,15 +58,11 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def train_and_predict_direction(ticker: str, db) -> float:
     """
-    Loads historical prices/technicals, trains a GradientBoostingClassifier
-    using walk-forward temporal split, and returns the probability of the
-    next close being higher than the current close.
-
-    Returns 0.50 (neutral) if:
-    - Not enough data
-    - Model confidence is below CONFIDENCE_THRESHOLD
-    - Any NaN in the final prediction features
+    Loads historical prices/technicals and sentiment, trains a GradientBoostingClassifier
+    using walk-forward temporal split and RandomizedSearchCV, and returns the probability
+    of a breakout (return > 0.2%).
     """
+    # 1. Fetch Price Data
     query = text("""
         SELECT timestamp, close, open, high, low, volume,
                rsi, macd, macd_signal, sma_20, sma_50, sma_200, adx, atr
@@ -83,9 +80,39 @@ def train_and_predict_direction(ticker: str, db) -> float:
         "rsi", "macd", "macd_signal", "sma_20", "sma_50", "sma_200", "adx", "atr"
     ])
 
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    
+    # 2. Fetch Sentiment Data
+    sentiment_query = text("""
+        SELECT DATE_TRUNC('day', a.published_date) as day, AVG(a.sentiment_score) as sentiment_score
+        FROM news_articles a
+        JOIN news_company_mappings m ON a.id = m.article_id
+        WHERE m.company_ticker = :ticker AND a.sentiment_score IS NOT NULL
+        GROUP BY 1 ORDER BY 1
+    """)
+    sentiment_rows = db.execute(sentiment_query, {"ticker": ticker}).fetchall()
+    
+    if sentiment_rows:
+        df_sent = pd.DataFrame(sentiment_rows, columns=["day", "sentiment_score"])
+        df_sent["day"] = pd.to_datetime(df_sent["day"])
+        
+        # Merge sentiment (asof or exact date)
+        # Assuming timestamps in df are end-of-day. We can extract just the date.
+        df["date_only"] = df["timestamp"].dt.floor("D")
+        df_sent["date_only"] = df_sent["day"].dt.floor("D")
+        
+        # Group sentiment by date_only just in case
+        df_sent = df_sent.groupby("date_only", as_index=False)["sentiment_score"].mean()
+        
+        df = pd.merge(df, df_sent, on="date_only", how="left")
+        df["sentiment_score"] = df["sentiment_score"].fillna(0.0)
+        df.drop(columns=["date_only"], inplace=True)
+    else:
+        df["sentiment_score"] = 0.0
+
     # Cast all numeric columns from Decimal/object to float
     numeric_cols = ["close", "open", "high", "low", "volume",
-                    "rsi", "macd", "macd_signal", "sma_20", "sma_50", "sma_200", "adx", "atr"]
+                    "rsi", "macd", "macd_signal", "sma_20", "sma_50", "sma_200", "adx", "atr", "sentiment_score"]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -98,15 +125,15 @@ def train_and_predict_direction(ticker: str, db) -> float:
         "rsi", "macd_spread", "price_to_sma20", "price_to_sma50", "price_to_sma200",
         "adx", "atr_pct", "momentum_5d", "momentum_10d", "momentum_20d",
         "rolling_std_10d", "volume_ratio", "bb_position", "price_velocity",
-        "sma20_above_sma50", "sma50_above_sma200"
+        "sma20_above_sma50", "sma50_above_sma200", "sentiment_score"
     ]
 
     # Explicitly cast all feature columns to float64 to prevent object-type arrays in numpy/sklearn
     for col in feature_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
 
-    # Target: 1 if close tomorrow > close today
-    df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
+    # Target: 1 if close tomorrow > close today * 1.002 (0.2% breakout)
+    df["target"] = (df["close"].shift(-1) > (df["close"] * 1.002)).astype(int)
 
     # Drop NaN rows (caused by rolling windows and shifts)
     df_clean = df.dropna(subset=feature_cols + ["target"])
@@ -121,31 +148,39 @@ def train_and_predict_direction(ticker: str, db) -> float:
     if len(train_data) < 20:
         return 0.50
 
-    X_train = train_data[feature_cols].values
+    X_train = train_data[feature_cols].values.astype(float)
     y_train = train_data["target"].values
 
     # Handle any remaining NaN in training features
     if np.isnan(X_train).any():
         X_train = np.nan_to_num(X_train, nan=0.0)
 
-    # Scale features (GBM benefits from scaled inputs for numerical stability)
+    # Scale features
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
 
-    # Train GradientBoostingClassifier
-    model = GradientBoostingClassifier(
-        n_estimators=100,
-        max_depth=3,
-        learning_rate=0.05,
-        subsample=0.8,
-        min_samples_leaf=5,
-        random_state=42
+    # Hyperparameter Tuning using RandomizedSearchCV
+    param_dist = {
+        'n_estimators': [50, 100, 150],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'max_depth': [2, 3, 5],
+        'subsample': [0.8, 1.0],
+        'min_samples_leaf': [2, 5]
+    }
+    
+    base_model = GradientBoostingClassifier(random_state=42)
+    # We use cv=3 to keep it fast, n_iter=5 randomly samples 5 parameter settings
+    search = RandomizedSearchCV(
+        base_model, param_distributions=param_dist, n_iter=5, cv=3, 
+        scoring='accuracy', random_state=42, n_jobs=-1
     )
-    model.fit(X_train_scaled, y_train)
+    
+    search.fit(X_train_scaled, y_train)
+    model = search.best_estimator_
 
     # Evaluate validation metrics on test split
     acc, prec, rec, f1 = 0.5, 0.5, 0.5, 0.5
-    X_test = test_data[feature_cols].values
+    X_test = test_data[feature_cols].values.astype(float)
     y_test = test_data["target"].values
     if len(X_test) > 0:
         if np.isnan(X_test).any():
@@ -182,7 +217,7 @@ def train_and_predict_direction(ticker: str, db) -> float:
     })
 
     # Predict for the latest data point
-    last_features = pred_row[feature_cols].values.reshape(1, -1)
+    last_features = df[feature_cols].iloc[-1].values.astype(float).reshape(1, -1)
 
     if np.isnan(last_features).any():
         return 0.50

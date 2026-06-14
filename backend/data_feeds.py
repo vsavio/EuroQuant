@@ -12,7 +12,7 @@ class YFinanceFeed(DataFeed):
         if start and end:
             df = yf.download(ticker, start=start, end=end, progress=False)
         else:
-            df = yf.download(ticker, period="60d", progress=False)
+            df = yf.download(ticker, period="2y", progress=False)
         if df.empty:
             raise ValueError(f"No data returned from Yahoo Finance for ticker {ticker}")
         return df

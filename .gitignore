@@ -15,4 +15,3 @@ out/
 build/
 .DS_Store
 *.sh.old
-node_modules/
