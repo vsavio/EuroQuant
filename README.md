@@ -21,63 +21,56 @@ graph TD
 ```
 
 The ecosystem is split into 5 core services:
-1. **Frontend (`frontend/`)**: A Next.js Web Terminal styled with a high-fidelity terminal developer aesthetic. Includes chart indicators (Bollinger Bands, RSI, MACD, SMAs), backtest parameter configuration, manual override triggers, and a real-time WebSocket connection.
-2. **Backend (`backend/`)**: A FastAPI ASGI gateway managing live client connections, active signal endpoints, overrides, broker account telemetry sync, and WebSocket telemetry broadcasts.
-3. **Database (`db/`)**: A PostgreSQL instance initialized with schemas for stock prices, news articles, recommendation logs, manual overrides, and MT5 broker account telemetry.
-4. **Worker Pipeline (`worker/`)**: A Python background orchestrator that scrapes financial RSS feeds, clusters similar/duplicate news using a local Hugging Face embedding model (`all-MiniLM-L6-v2`), evaluates technical indicators (ADX, ATR, MACD, RSI, SMA), queries systemic risk (VSTOXX index), uses Ollama for sentiment analysis, and persists recommendation logs.
-5. **MetaTrader 5 EA (`mt5_ea/`)**: MQL5 Expert Advisors (`EuroQuant_Bridge.mq5` and `EuroQuant_MultiSymbol_Bridge.mq5`) that poll the FastAPI backend, report broker account telemetry (equity, balance, margin, profit), resolve symbol suffixes dynamically, and execute orders with dynamic ATR-based Stop Loss and Take Profit levels.
+1. **Frontend (`frontend/`)**: A Next.js Web Terminal styled with a high-fidelity terminal developer aesthetic. Includes chart indicators (Bollinger Bands, RSI, MACD, SMAs), backtest parameter configuration, manual override triggers, dynamic Asset Config, and a real-time WebSocket connection.
+2. **Backend (`backend/`)**: A FastAPI ASGI gateway managing live client connections, active signal endpoints, overrides, asset management APIs, broker account telemetry sync, and WebSocket telemetry broadcasts.
+3. **Database (`db/`)**: A PostgreSQL instance initialized with schemas for stock prices, news articles, recommendation logs, manual overrides, dynamic companies/tickers, and MT5 broker account telemetry.
+4. **Worker Pipeline (`worker/`)**: A Python background orchestrator that scrapes financial feeds, clusters similar/duplicate news using a local Hugging Face embedding model, evaluates technical indicators, queries systemic risk, uses Ollama for sentiment analysis, and persists recommendation logs.
+5. **MetaTrader 5 EA (`mt5_ea/`)**: MQL5 Expert Advisors (`EuroQuant_MultiSymbol_Bridge.mq5`) that poll the FastAPI backend, report broker account telemetry, resolve symbol suffixes dynamically, and execute orders with advanced Break-Even logic and dynamic ATR-based Trailing Stops.
 
 ---
 
 ## ✨ Enterprise Upgrades & Features
 
-### 1. Server-side Backtesting Engine
+### 1. Dynamic Asset Management
+The frontend includes a self-service **Asset Config** dashboard:
+*   Activate or deactivate assets (Equities, Indices, Crypto) dynamically without restarting containers.
+*   The backend and worker nodes immediately respect the asset status (`is_active` flag), isolating disabled symbols from scraping and inference cycles.
+*   Provides an intuitive form to seamlessly add new symbols (e.g., `NFLX`, `BTCUSD`) bridging them directly to the MT5 Terminal.
+
+### 2. Advanced EA Risk Management (Break-Even & Trailing Stop)
+The MT5 Multi-Symbol EA employs robust institutional safeguards:
+*   **Two-Stage Profit Protection**: Incorporates a Smart Break-Even system that first snaps the Stop Loss to the entry price once a specific profit margin (configured via ATR) is achieved, securing the trade.
+*   **ATR-Based Dynamic Trailing Stop**: Once break-even is secured, the EA trails the price at an adaptive distance derived from daily Average True Range (ATR) to avoid premature exits on volatile assets like Bitcoin.
+*   **Fail-Safe Error Logging**: Comprehensive fallback logic captures all MT5 native error codes (`GetLastError()`) mapping execution failures for deep visibility.
+
+### 3. Server-side Backtesting Engine
 The backtesting simulator runs entirely on the Python backend (`/api/backtest`). It evaluates trading performance across 250 daily periods by correlating historical price data, RSI indicators, and historical news sentiment scores. It computes key quantitative performance metrics including:
 *   **Total return %** and **Benchmark buy-and-hold return %**
 *   **Max Drawdown %**
 *   **Sharpe Ratio** (annualized based on 252 trading days)
 *   **Win Rate %**
-*   **Equity Curve** time-series data plotted in real-time.
 
-### 2. Real-Time WebSockets Communication Channel
+### 4. Real-Time WebSockets Communication Channel
 The system establishes a full-duplex WebSocket connection (`/ws/telemetry`) between the web browser, the FastAPI backend, and the background worker. Whenever an EA checks in with telemetry or a manual override is engaged, the backend broadcasts a message. The React frontend immediately triggers a re-fetch of account balances, open positions, and active signals, rendering changes instantly.
 
-### 3. Local Embeddings & News Clustering (Worker NLP)
+### 5. Local Embeddings & News Clustering (Worker NLP)
 To prevent duplicate stories from cluttering the dashboard and wasting local LLM resources, the background worker utilizes the **`sentence-transformers/all-MiniLM-L6-v2`** model. 
 *   Scraped headlines are embedded locally on CPU/GPU.
 *   Cosine similarity is computed for all unprocessed stories.
 *   Stories with a similarity score $> 0.78$ are grouped.
 *   Duplicate child articles share the parent's LLM sentiment score and ticker mapping, saving API/Ollama call latency.
 
-### 4. Centralized Risk Control & Emergency Kill Switch
+### 6. Centralized Risk Control & Emergency Kill Switch
 Centralized risk features protect capital from market anomalies:
-*   **Aggregate Drawdown Check**: The backend automatically sums the balance and equity across all active MT5 accounts. If the aggregate drawdown exceeds the user-defined limit (e.g., $5.0\%$), a global risk state is triggered.
+*   **Aggregate Drawdown Check**: The backend automatically sums the balance and equity across all active MT5 accounts. If the aggregate drawdown exceeds the user-defined limit, a global risk state is triggered.
 *   **Emergency Kill-Switch**: A global toggle on the dashboard allows immediate manual suspension of all trading.
 *   **Downstream EA Close All**: When either risk limit is breached or the kill-switch is activated, all symbol signals are overridden with the `CLOSE_ALL` action. The downstream Expert Advisors pick up this status within their polling cycle, immediately close all open trades, and abort new order entry.
-
-### 5. Dynamic Suffix Resolution & Spread threshold
-*   **Suffix Handling**: Resolves broker suffix conventions dynamically (e.g. `ENI.CP` for Capital Point Trading Ltd) inside the EA, matching assets cleanly back to the database ticker.
-*   **Dynamic Spread Control**: Orders are skipped if the broker spread exceeds the maximum threshold, dynamically configured as a percentage of the ask price (`InpMaxSpreadPercent`) or static point limits (`InpMaxSpreadPoints`).
-
-### 6. Multi-Mode Dynamic Position Sizing & Position Management
-Expert Advisors support three advanced position-sizing options and dynamic position management:
-*   **Moltiplicatore Lotto Minimo (`SIZING_MIN_LOT_MULTIPLIER`)**: Trades a fixed lot calculated as `SYMBOL_VOLUME_MIN` multiplied by `InpLotMultiplier` and adjusted by volatility.
-*   **Percentuale Rischio (`SIZING_RISK_PERCENT`)**: Dynamically risks a fixed % of account balance per trade (`InpRiskPercent`) calculated based on the distance to the ATR Stop Loss.
-*   **Percentuale Margine (`SIZING_MARGIN_PERCENT`)**: Restricts the trade size to allocate a fixed % of account balance (`InpMarginPercent`) as margin.
-*   **TP1 Partial Close & Break-Even SL**: If `InpEnablePartialClose` is active, when the price reaches the entry price plus/minus the target distance (`InpPartialCloseAtrMultiplier * SL`), the EA closes 50% of the volume (normalized to the symbol step) and moves the Stop Loss to break-even (entry price).
 
 ### 7. Compliance Audit Log (Security Trail)
 An immutable ledger tracking security-critical events:
 *   **User Action Logging**: Stores login success/failure, administrative overrides, VSTOXX threshold changes, and manual signal execution.
 *   **SQL Persistence**: Saved in PostgreSQL table `audit_log` with IP addresses, timestamps, and JSON-formatted modification payloads.
 *   **Web Console**: Accessible via the `🔐 Compliance Audit` tab in the web terminal for administrators.
-
-### 8. AI/ML Engine & Online Walk-Forward Retraining
-The price direction forecasting classifier is subject to continuous assessment:
-*   **Walk-Forward Metrics**: Automatically calculates test accuracy, precision, recall, and f1-score (80% train / 20% test split) during each training.
-*   **Metrics Database**: Persisted in `ml_model_metrics` for monitoring historical performance.
-*   **Telegram & Discord Alerts**: Real-time webhook notifications are sent automatically to Discord and Telegram channels on settings updates, safeguard triggers, or manual overrides.
-*   **Web Control Panel**: The `🧠 AI/ML Engine` dashboard lists walk-forward metrics ticker-by-ticker, including visual color-coded accuracy bars and a button to trigger model retraining.
 
 ---
 
@@ -92,7 +85,7 @@ The price direction forecasting classifier is subject to continuous assessment:
     ```
 
 ### 1. Setup Environment
-Clone the repository and inspect the configurations in `docker-compose.yml`. You can customize the news scrape loop interval and local Ollama endpoint using the environment variables in the `worker` service block:
+Clone the repository and inspect the configurations in `docker-compose.yml`. Ensure your `.env` contains the proper secret keys. You can customize the news scrape loop interval and local Ollama endpoint using the environment variables in the `worker` service block:
 ```yaml
 LOOP_INTERVAL_HOURS: 1  # Scraping frequency
 OLLAMA_HOST: "http://host.docker.internal:11434" # Host Ollama address
@@ -123,71 +116,43 @@ To connect MetaTrader 5 to your local EuroQuant server:
 3. Check **Allow WebRequest for listed URL** and add:
    ```text
    http://localhost:8000
+   http://127.0.0.1:8000
    ```
-4. Copy `EuroQuant_Bridge.mq5` (for single-symbol EAs) or `EuroQuant_MultiSymbol_Bridge.mq5` (for multi-symbol trading) into your MT5 directory:
+4. Copy `EuroQuant_MultiSymbol_Bridge.mq5` into your MT5 directory:
    `MQL5/Experts/`
 5. Compile the EA and attach it to your desired chart.
 6. Configure the inputs:
-   *   `Bridge_URL`: `http://localhost:8000/api/mt5/signals`
-   *   `Ticker`: (e.g., `TEF.MC` for Telefónica, or matching symbol config)
-   *   `InpMaxSpreadPercent`: Dynamic spread threshold percentage of Ask (e.g. `0.05` for 0.05%). Set to `0` to fall back to static points.
-   *   `InpMaxSpreadPoints`: Static spread threshold points (e.g. `100`).
+   *   `InpApiUrl`: `http://localhost:8000/api/mt5/signals`
+   *   `InpUseBreakEven`: Enables smart protection by trailing SL to `open_price` first.
+   *   `InpBreakEvenAtrMult`: Distance multiplier defining when to trigger Break-Even.
+   *   `InpMaxSpreadPercent`: Dynamic spread threshold percentage of Ask (e.g. `0.25` for 0.25%). Set to `0` to fall back to static points.
 
 ---
 
 ## 📡 API Reference
 
+### Asset Management
+*   **`GET /api/tickers`**: Fetch the list of dynamically configurable assets.
+*   **`POST /api/tickers/add`**: Provision a new instrument to the pipeline.
+*   **`POST /api/tickers/toggle`**: Enable/Disable scraping and trading for a specific instrument.
+
 ### MT5 Signals & Telemetry
-*   **`GET /api/mt5/signals`**
-    *   **Description**: Invoked by MT5 EAs to fetch active recommendation signals, entries, Stop Loss, Take Profit, and reasoning details. Automatically checks global risk drawdowns, manual overrides, and the kill switch state.
-    *   **Parameters**: `ticker` (string, optional)
-*   **`POST /api/mt5/signals`**
-    *   **Description**: Invoked by MT5 EAs to register/sync broker account telemetry.
-    *   **Payload**:
-        ```json
-        {
-          "account_id": 123456,
-          "broker": "Capital Point Trading Ltd",
-          "balance": 10000.00,
-          "equity": 9850.00,
-          "margin": 200.00,
-          "margin_free": 9650.00,
-          "margin_level": 4925.00,
-          "profit": -150.00
-        }
-        ```
+*   **`GET /api/mt5/signals`**: Invoked by MT5 EAs to fetch active recommendation signals, entries, Stop Loss, Take Profit, and reasoning details. Automatically checks global risk drawdowns, manual overrides, and the kill switch state.
+*   **`POST /api/mt5/positions`**: Submits active MT5 positions arrays to synchronize dashboard states.
 
 ### Centralized Risk Settings
-*   **`GET /api/mt5/risk`**
-    *   **Description**: Retrieves current risk limits, kill switch active status, and current aggregate drawdown %.
-*   **`POST /api/mt5/risk`**
-    *   **Description**: Update maximum allowed aggregate drawdown percentage.
-    *   **Payload**: `{ "max_drawdown_percent": 8.5 }`
-*   **`POST /api/mt5/risk/kill-switch`**
-    *   **Description**: Enable or disable the emergency kill switch.
-    *   **Payload**: `{ "active": true }`
+*   **`GET /api/mt5/risk`**: Retrieves current risk limits, kill switch active status, and current aggregate drawdown %.
+*   **`POST /api/mt5/risk`**: Update maximum allowed aggregate drawdown percentage.
+*   **`POST /api/mt5/risk/kill-switch`**: Enable or disable the emergency kill switch.
 
 ### Manual Overrides
-*   **`GET /api/mt5/overrides`**
-    *   **Description**: Returns all currently active manual overrides.
-*   **`POST /api/mt5/overrides`**
-    *   **Description**: Force a manual signal for a ticker symbol.
-    *   **Payload**:
-        ```json
-        {
-          "ticker": "TEF.MC",
-          "action": "BUY" // BUY, SELL, HOLD, or CLEAR
-        }
-        ```
+*   **`GET /api/mt5/overrides`**: Returns all currently active manual overrides.
+*   **`POST /api/mt5/overrides`**: Force a manual signal for a ticker symbol.
 
 ### Compliance & AI/ML Control
-*   **`GET /api/audit-log`**
-    *   **Description**: Retrieves recent administrative and risk override audit trail logs.
-    *   **Parameters**: `limit` (integer, default `100`)
-*   **`GET /api/ml/metrics`**
-    *   **Description**: Returns walk-forward validation accuracy and statistics for all trained models.
-*   **`POST /api/ml/retrain`**
-    *   **Description**: Triggers a background thread to initiate online model retraining across all symbol companies.
+*   **`GET /api/audit-log`**: Retrieves recent administrative and risk override audit trail logs.
+*   **`GET /api/ml/metrics`**: Returns walk-forward validation accuracy and statistics for all trained models.
+*   **`POST /api/ml/retrain`**: Triggers a background thread to initiate online model retraining across all symbol companies.
 
 ---
 
