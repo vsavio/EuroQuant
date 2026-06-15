@@ -41,8 +41,9 @@ from database import init_db_connection
 from scraper import scrape_feeds
 from nlp import process_unprocessed_news
 from quant import fetch_and_calculate_all
-from recommender import generate_recommendations
+from recommender import generate_recommendations, check_ollama_health
 from config import RUN_ONCE_AND_LOOP, LOOP_INTERVAL_HOURS
+
 
 def archive_historical_data():
     print("Running database archiving routine...")
@@ -87,9 +88,16 @@ def archive_historical_data():
 def run_pipeline():
     print("=========================================")
     print(f"Pipeline Execution Triggered: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=========================================")
+    print("=========================================" )
     
-    # 0. Scrape Economic Calendar
+    # 0a. Ollama Health-Check (single ping, avoids 30s timeout per ticker)
+    try:
+        is_up = check_ollama_health()
+        print(f"Ollama status: {'ONLINE' if is_up else 'OFFLINE — using Gemini/rule-based fallback'}")
+    except Exception as e:
+        print(f"Pipeline Error in Ollama Health-Check: {e}")
+
+    # 0b. Scrape Economic Calendar
     try:
         from calendar_scraper import scrape_economic_calendar
         scrape_economic_calendar()
@@ -146,14 +154,50 @@ def run_pipeline():
         evaluate_hedging_strategy()
     except Exception as e:
         print(f"Pipeline Error in Hedging Evaluator: {e}")
-        
-    # 8. Live Broker Execution (Disabled - Managed by MT5 EA Pull Architecture)
+
+    # 8. Backtest Engine — evaluate historical signal accuracy
+    try:
+        from backtest import run_backtest
+        run_backtest()
+    except Exception as e:
+        print(f"Pipeline Error in Backtest Engine: {e}")
+
+    # 9. Live Broker Execution (Disabled - Managed by MT5 EA Pull Architecture)
     # The MQL5 EA directly polls /api/mt5/signals
     # so we don't push trades from here.
+
         
     print("=========================================")
     print(f"Pipeline Execution Completed: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=========================================\n")
+
+def send_heartbeat():
+    """Send a heartbeat notification via Telegram to confirm the worker is alive."""
+    try:
+        import requests as req
+        from database import SessionLocal
+        from sqlalchemy import text
+        db = SessionLocal()
+        try:
+            settings = db.execute(text(
+                "SELECT telegram_bot_token, telegram_chat_id FROM system_settings WHERE id = 1"
+            )).fetchone()
+            if settings and settings[0] and settings[1]:
+                tg_token, tg_chat_id = settings[0], settings[1]
+                msg = (
+                    f"\U0001F49A <b>EuroQuant Worker — Heartbeat</b>\n"
+                    f"Timestamp: <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</code>\n"
+                    f"Status: <b>ONLINE</b> — pipeline attiva e operativa."
+                )
+                req.post(
+                    f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                    json={"chat_id": tg_chat_id, "text": msg, "parse_mode": "HTML"},
+                    timeout=10
+                )
+        finally:
+            db.close()
+    except Exception:
+        pass  # Heartbeat errors are non-critical
 
 def check_risk_telemetry():
     """Independent risk engine that monitors drawdown and trips the kill-switch if necessary."""
@@ -394,6 +438,8 @@ def main():
     
     if RUN_ONCE_AND_LOOP:
         interval_seconds = LOOP_INTERVAL_HOURS * 3600
+        heartbeat_interval = 1800  # 30 minutes
+        last_heartbeat_time = time.time()
         print(f"Worker scheduled to run every {LOOP_INTERVAL_HOURS} hours ({interval_seconds}s) or on-demand via job_queue.")
         try:
             while True:
@@ -403,6 +449,11 @@ def main():
                 # Check risk independently
                 check_risk_telemetry()
                 monitor_vix_and_hedge()
+                
+                # Send heartbeat every 30 minutes
+                if time.time() - last_heartbeat_time >= heartbeat_interval:
+                    send_heartbeat()
+                    last_heartbeat_time = time.time()
                 
                 # Check for pending jobs in database
                 db = SessionLocal()

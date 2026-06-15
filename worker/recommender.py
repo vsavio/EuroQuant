@@ -19,6 +19,27 @@ logging.basicConfig(
 )
 log = logging.getLogger("recommender")
 
+# ─── Ollama Health-Check ──────────────────────────────────────────────────────
+# Checked once per pipeline run. If Ollama is offline we skip it immediately
+# instead of wasting 30s per ticker in connection timeouts.
+_ollama_available: bool = False
+
+def check_ollama_health() -> bool:
+    """Ping Ollama. Returns True if the service is up and responsive."""
+    global _ollama_available
+    try:
+        r = requests.get(OLLAMA_HOST, timeout=3)
+        _ollama_available = r.status_code == 200
+    except Exception:
+        _ollama_available = False
+    if not _ollama_available:
+        log.warning(json.dumps({"event": "ollama_offline", "host": OLLAMA_HOST,
+                                 "msg": "Ollama unreachable — skipping for this pipeline run"}))
+    else:
+        log.info(json.dumps({"event": "ollama_online", "host": OLLAMA_HOST}))
+    return _ollama_available
+
+
 def get_latest_price_metrics(ticker, db):
     """Retrieves the latest two stock price records for a ticker to calculate metrics."""
     query = text("""
@@ -222,38 +243,39 @@ You MUST respond ONLY with a valid JSON object in Italian matching this schema:
 Do not write any text outside of the JSON block. Do not include markdown code ticks.
 """
 
-    # 1. Try Ollama (Local)
-    try:
-        url = f"{OLLAMA_HOST}/api/generate"
-        payload = {
-            "model": "qwen2.5:3b",
-            "prompt": prompt,
-            "stream": False,
-            "format": "json",
-            "options": {
-                "num_thread": 4,
-                "num_predict": 250
+    # 1. Try Ollama (Local) — only if health-check passed
+    if _ollama_available:
+        try:
+            url = f"{OLLAMA_HOST}/api/generate"
+            payload = {
+                "model": "qwen2.5:3b",
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",
+                "options": {
+                    "num_thread": 4,
+                    "num_predict": 250
+                }
             }
-        }
-        
-        response = requests.post(url, json=payload, timeout=30)
-        if response.status_code == 200:
-            res_data = response.json()
-            raw_text = res_data.get("response", "").strip()
-            data = json.loads(raw_text)
             
-            rating = data.get("rating", "HOLD").upper()
-            if rating not in ["STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL"]:
-                rating = "HOLD"
+            response = requests.post(url, json=payload, timeout=30)
+            if response.status_code == 200:
+                res_data = response.json()
+                raw_text = res_data.get("response", "").strip()
+                data = json.loads(raw_text)
                 
-            return {
-                "rating": rating,
-                "reason_macro": data.get("reason_macro", ""),
-                "reason_micro": data.get("reason_micro", ""),
-                "reason_technical": data.get("reason_technical", "")
-            }
-    except Exception as e:
-        print(f"Ollama recommendation failed for {ticker}: {e}. Trying Gemini API fallback...")
+                rating = data.get("rating", "HOLD").upper()
+                if rating not in ["STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL"]:
+                    rating = "HOLD"
+                    
+                return {
+                    "rating": rating,
+                    "reason_macro": data.get("reason_macro", ""),
+                    "reason_micro": data.get("reason_micro", ""),
+                    "reason_technical": data.get("reason_technical", "")
+                }
+        except Exception as e:
+            print(f"Ollama recommendation failed for {ticker}: {e}. Trying Gemini API fallback...")
         
     # 2. Fallback to Gemini API
     gemini_res = query_gemini_recommendation(ticker, company_name, metrics, sentiment, news, v2tx, prompt)

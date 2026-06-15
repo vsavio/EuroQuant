@@ -1798,6 +1798,33 @@ async def sync_execution_log(payload: ExecutionLogPayload):
         print(f"Error saving execution log: {e}")
         raise HTTPException(status_code=500, detail="Database error")
 
+@app.get("/api/backtest/results")
+def get_backtest_results():
+    """Returns historical backtest performance metrics for all tickers."""
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT ticker, total_trades, win_rate, avg_return_pct,
+                       sharpe_ratio, max_drawdown_pct, last_computed
+                FROM backtest_results
+                ORDER BY sharpe_ratio DESC NULLS LAST
+            """)).fetchall()
+            return [
+                {
+                    "ticker": r[0],
+                    "total_trades": r[1],
+                    "win_rate": float(r[2]) if r[2] is not None else 0.0,
+                    "avg_return_pct": float(r[3]) if r[3] is not None else 0.0,
+                    "sharpe_ratio": float(r[4]) if r[4] is not None else 0.0,
+                    "max_drawdown_pct": float(r[5]) if r[5] is not None else 0.0,
+                    "last_computed": r[6].isoformat() if r[6] else None,
+                }
+                for r in rows
+            ]
+    except Exception as e:
+        print(f"Error fetching backtest results: {e}")
+        return []
+
 
 @app.get("/api/recommendations/history", response_model=List[SignalHistoryItem])
 def get_recommendations_history(ticker: str):
