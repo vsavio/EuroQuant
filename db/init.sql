@@ -1,11 +1,22 @@
+CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;
+
 CREATE TABLE IF NOT EXISTS system_settings (
     id INTEGER PRIMARY KEY DEFAULT 1,
     telegram_bot_token VARCHAR(255) DEFAULT '',
     telegram_chat_id VARCHAR(50) DEFAULT '',
     discord_webhook_url TEXT DEFAULT '',
+    trading_halted BOOLEAN DEFAULT FALSE,
     CONSTRAINT single_row CHECK (id = 1)
 );
 INSERT INTO system_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS system_logs (
+    id SERIAL PRIMARY KEY,
+    level VARCHAR(10) DEFAULT 'INFO',
+    source VARCHAR(50) DEFAULT 'worker',
+    message TEXT NOT NULL,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
 
 -- Audit log: tracks all security-critical and administrative actions
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -27,11 +38,11 @@ CREATE TABLE IF NOT EXISTS companies (
     country VARCHAR(50) NOT NULL,
     sector VARCHAR(50) NOT NULL,
     industry VARCHAR(100),
-    trust_score NUMERIC(3, 2) DEFAULT 0.60
+    trust_score NUMERIC(3, 2) DEFAULT 0.60,
+    is_active BOOLEAN DEFAULT TRUE
 );
 
 CREATE TABLE IF NOT EXISTS stock_prices (
-    id SERIAL PRIMARY KEY,
     ticker VARCHAR(20) REFERENCES companies(ticker) ON DELETE CASCADE,
     timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
     open NUMERIC(15, 4),
@@ -45,8 +56,14 @@ CREATE TABLE IF NOT EXISTS stock_prices (
     sma_20 NUMERIC(15, 4),
     sma_50 NUMERIC(15, 4),
     sma_200 NUMERIC(15, 4),
-    UNIQUE(ticker, timestamp)
+    adx NUMERIC(15, 4),
+    atr NUMERIC(15, 4),
+    PRIMARY KEY (ticker, timestamp)
 );
+
+SELECT create_hypertable('stock_prices', 'timestamp', if_not_exists => TRUE);
+ALTER TABLE stock_prices SET (timescaledb.compress, timescaledb.compress_segmentby = 'ticker');
+SELECT add_compression_policy('stock_prices', INTERVAL '30 days');
 
 CREATE TABLE IF NOT EXISTS news_articles (
     id SERIAL PRIMARY KEY,
@@ -231,12 +248,12 @@ INSERT INTO companies (ticker, name, country, sector, industry, trust_score) VAL
 -- South Korea
 ('005930.KS', 'Samsung Electronics Co., Ltd.', 'South Korea', 'Technology', 'Consumer Electronics', 0.90),
 -- Crypto
-('BTC-USD', 'Bitcoin', 'Crypto', 'Crypto', 'Cryptocurrency', 0.95),
-('ETH-USD', 'Ethereum', 'Crypto', 'Crypto', 'Cryptocurrency', 0.90),
-('XRP-USD', 'Ripple', 'Crypto', 'Crypto', 'Cryptocurrency', 0.85),
-('SOL-USD', 'Solana', 'Crypto', 'Crypto', 'Cryptocurrency', 0.85),
-('ADA-USD', 'Cardano', 'Crypto', 'Crypto', 'Cryptocurrency', 0.80),
-('DOT-USD', 'Polkadot', 'Crypto', 'Crypto', 'Cryptocurrency', 0.80)
+('BTCUSD', 'Bitcoin', 'Crypto', 'Crypto', 'Cryptocurrency', 0.95),
+('ETHUSD', 'Ethereum', 'Crypto', 'Crypto', 'Cryptocurrency', 0.90),
+('XRPUSD', 'Ripple', 'Crypto', 'Crypto', 'Cryptocurrency', 0.85),
+('SOLUSD', 'Solana', 'Crypto', 'Crypto', 'Cryptocurrency', 0.85),
+('ADAUSD', 'Cardano', 'Crypto', 'Crypto', 'Cryptocurrency', 0.80),
+('DOTUSD', 'Polkadot', 'Crypto', 'Crypto', 'Cryptocurrency', 0.80)
 ON CONFLICT (ticker) DO UPDATE SET
     name = EXCLUDED.name,
     country = EXCLUDED.country,
@@ -299,3 +316,47 @@ CREATE TABLE IF NOT EXISTS economic_calendar (
 );
 CREATE INDEX IF NOT EXISTS idx_econ_calendar_time ON economic_calendar (scheduled_time DESC);
 
+-- Portfolio optimization weights
+CREATE TABLE IF NOT EXISTS portfolio_weights (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(20) NOT NULL,
+    weight DECIMAL(10, 4) NOT NULL,
+    method VARCHAR(50) DEFAULT 'markowitz',
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Hedging strategies (Black-Scholes Options)
+CREATE TABLE IF NOT EXISTS hedging_strategies (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(20) NOT NULL,
+    option_type VARCHAR(10) NOT NULL,
+    strike NUMERIC(15, 4) NOT NULL,
+    expiry_days INTEGER NOT NULL,
+    theoretical_price NUMERIC(15, 4) NOT NULL,
+    delta NUMERIC(8, 4),
+    gamma NUMERIC(8, 4),
+    theta NUMERIC(8, 4),
+    vega NUMERIC(8, 4),
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Live Broker Integration
+CREATE TABLE IF NOT EXISTS live_positions (
+    ticker VARCHAR(20) PRIMARY KEY,
+    quantity NUMERIC(15, 6) NOT NULL,
+    avg_price NUMERIC(15, 4) NOT NULL,
+    current_price NUMERIC(15, 4) NOT NULL,
+    unrealized_pnl NUMERIC(15, 4),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS execution_logs (
+    id SERIAL PRIMARY KEY,
+    ticker VARCHAR(20) NOT NULL,
+    action VARCHAR(10) NOT NULL, -- BUY, SELL
+    quantity NUMERIC(15, 6) NOT NULL,
+    fill_price NUMERIC(15, 4) NOT NULL,
+    slippage NUMERIC(10, 4),
+    broker VARCHAR(20) NOT NULL,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);

@@ -10,6 +10,14 @@ LOOP_INTERVAL_HOURS = float(os.getenv("LOOP_INTERVAL_HOURS", "2"))
 # Volatility warning threshold
 V2TX_THRESHOLD = 30.0
 
+# Deep Learning Settings
+USE_DEEP_LEARNING = os.getenv("USE_DEEP_LEARNING", "true").lower() == "true"
+USE_REINFORCEMENT_LEARNING = os.getenv("USE_REINFORCEMENT_LEARNING", "true").lower() == "true"
+
+# Live Trading Settings
+ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true"
+BROKER_TYPE = os.getenv("BROKER_TYPE", "paper") # 'mt5', 'alpaca', or 'paper'
+
 # European and Global Indices to track
 INDICES = {
     "^STOXX": "STOXX Europe 600",

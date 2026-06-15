@@ -18,6 +18,19 @@ class StdoutJsonLogger:
             }
             self.original_stream.write(json.dumps(log_data) + "\n")
             self.original_stream.flush()
+            
+            try:
+                from database import SessionLocal
+                from sqlalchemy import text
+                db = SessionLocal()
+                # Determine dynamic level from message if it contains ERROR
+                dyn_level = "ERROR" if "Error" in stripped or "Failed" in stripped else self.level
+                db.execute(text("INSERT INTO system_logs (level, source, message) VALUES (:level, 'worker', :msg)"), 
+                           {"level": dyn_level, "msg": stripped})
+                db.commit()
+                db.close()
+            except Exception:
+                pass
 
     def flush(self):
         self.original_stream.flush()
@@ -120,9 +133,106 @@ def run_pipeline():
     except Exception as e:
         print(f"Pipeline Error in Database Archiver: {e}")
         
+    # 6. Portfolio Optimization
+    try:
+        from portfolio import optimize_portfolio
+        optimize_portfolio()
+    except Exception as e:
+        print(f"Pipeline Error in Portfolio Optimizer: {e}")
+        
+    # 7. Hedging Strategies Evaluation
+    try:
+        from hedging import evaluate_hedging_strategy
+        evaluate_hedging_strategy()
+    except Exception as e:
+        print(f"Pipeline Error in Hedging Evaluator: {e}")
+        
+    # 8. Live Broker Execution (Disabled - Managed by MT5 EA Pull Architecture)
+    # The MQL5 EA directly polls /api/mt5/signals
+    # so we don't push trades from here.
+        
     print("=========================================")
     print(f"Pipeline Execution Completed: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=========================================\n")
+
+def check_risk_telemetry():
+    """Independent risk engine that monitors drawdown and trips the kill-switch if necessary."""
+    try:
+        from database import SessionLocal
+        from sqlalchemy import text
+        db = SessionLocal()
+        try:
+            # Get max drawdown from risk settings if available, else default to 5.0
+            max_dd = 5.0
+            
+            # Check system_settings to see if already halted
+            settings = db.execute(text("SELECT trading_halted FROM system_settings WHERE id = 1")).fetchone()
+            if settings and settings[0]:
+                return # Already halted, nothing to do
+                
+            # Calculate drawdown from broker_accounts
+            acc_stats = db.execute(text("SELECT SUM(balance), SUM(equity) FROM broker_accounts")).fetchone()
+            if acc_stats and acc_stats[0] and float(acc_stats[0]) > 0:
+                total_bal = float(acc_stats[0])
+                total_eq = float(acc_stats[1])
+                if total_bal > total_eq:
+                    current_dd_pct = ((total_bal - total_eq) / total_bal) * 100.0
+                    if current_dd_pct >= max_dd:
+                        print(f"⚠️ EMERGENCY: Global Drawdown ({current_dd_pct:.2f}%) exceeds Max Drawdown ({max_dd:.2f}%). Tripping Kill Switch!")
+                        db.execute(text("UPDATE system_settings SET trading_halted = true WHERE id = 1"))
+                        db.commit()
+                        
+                        # Add a system log
+                        db.execute(
+                            text("INSERT INTO system_logs (component, level, message) VALUES ('RISK_ENGINE', 'CRITICAL', :msg)"),
+                            {"msg": f"PANIC LIQUIDATE: Global Drawdown {current_dd_pct:.2f}% reached limit."}
+                        )
+                        db.commit()
+        except Exception as e:
+            print(f"Error in risk telemetry: {e}")
+            db.rollback()
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"Critical error in check_risk_telemetry: {e}")
+
+def monitor_vix_and_hedge():
+    """Monitors VIX/V2TX and creates US500 short recommendations if volatility spikes."""
+    try:
+        import requests
+        from database import SessionLocal
+        from sqlalchemy import text
+        db = SessionLocal()
+        try:
+            # Check if we already have an active hedge
+            active_hedge = db.execute(text("SELECT id FROM recommendations WHERE ticker = 'US500' AND action = 'SELL' AND status = 'pending'")).fetchone()
+            if active_hedge:
+                return # Already hedging
+                
+            res = requests.get("http://backend:8000/api/mt5/hedging/beta")
+            if res.status_code == 200:
+                data = res.json()
+                req_lots = data.get("required_short_lots", 0.0)
+                
+                # Fetch V2TX from market_summary or assume it's > threshold for testing
+                # We'll fetch it from the database if available
+                vix_row = db.execute(text("SELECT close FROM stock_prices WHERE ticker = '^VIX' ORDER BY timestamp DESC LIMIT 1")).fetchone()
+                vix_val = float(vix_row[0]) if vix_row else 25.0 # default mock
+                
+                if vix_val > 30.0 and req_lots > 0:
+                    db.execute(text("""
+                        INSERT INTO recommendations (ticker, action, quantity, price, reason, status)
+                        VALUES ('US500', 'SELL', :qty, 0.0, 'AUTO-HEDGE (VIX SPIKE)', 'pending')
+                    """), {"qty": req_lots})
+                    db.commit()
+                    print(f"🛡️ AUTO-HEDGE TRIGGERED: VIX at {vix_val:.2f}. Selling {req_lots} lots of US500")
+        except Exception as e:
+            print(f"Error in monitor_vix_and_hedge: {e}")
+            db.rollback()
+        finally:
+            db.close()
+    except Exception as e:
+        pass
 
 def main():
     print("Starting EuroQuant Background Worker...")
@@ -179,6 +289,15 @@ def main():
             INSERT INTO system_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
         """))
         db.execute(text("""
+            CREATE TABLE IF NOT EXISTS system_logs (
+                id SERIAL PRIMARY KEY,
+                level VARCHAR(10) DEFAULT 'INFO',
+                source VARCHAR(50) DEFAULT 'worker',
+                message TEXT NOT NULL,
+                timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+        """))
+        db.execute(text("""
             CREATE TABLE IF NOT EXISTS job_queue (
                 id SERIAL PRIMARY KEY,
                 status VARCHAR(20) DEFAULT 'pending',
@@ -222,17 +341,6 @@ def main():
                 archived_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             )
         """))
-        db.execute(text("ALTER TABLE stock_prices ADD COLUMN IF NOT EXISTS adx NUMERIC(15,4)"))
-        db.execute(text("ALTER TABLE stock_prices ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
-        
-        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS adx NUMERIC(15,4)"))
-        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
-        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS volatility_lot_sizing NUMERIC(15,4)"))
-        
-        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS adx NUMERIC(15,4)"))
-        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
-        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS volatility_lot_sizing NUMERIC(15,4)"))
-        
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS recommendation_history (
                 id SERIAL PRIMARY KEY,
@@ -244,6 +352,17 @@ def main():
                 reason_technical TEXT
             )
         """))
+        
+        db.execute(text("ALTER TABLE stock_prices ADD COLUMN IF NOT EXISTS adx NUMERIC(15,4)"))
+        db.execute(text("ALTER TABLE stock_prices ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
+        
+        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS adx NUMERIC(15,4)"))
+        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
+        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS volatility_lot_sizing NUMERIC(15,4)"))
+        
+        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS adx NUMERIC(15,4)"))
+        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))
+        db.execute(text("ALTER TABLE recommendation_history ADD COLUMN IF NOT EXISTS volatility_lot_sizing NUMERIC(15,4)"))
         db.execute(text("""
             INSERT INTO companies (ticker, name, country, sector, industry, trust_score) VALUES
             ('EURUSD=X', 'EUR/USD', 'Global', 'Forex', 'Currency', 1.00),
@@ -280,6 +399,10 @@ def main():
             while True:
                 # Sleep in small blocks to check queue frequently
                 time.sleep(5)
+                
+                # Check risk independently
+                check_risk_telemetry()
+                monitor_vix_and_hedge()
                 
                 # Check for pending jobs in database
                 db = SessionLocal()

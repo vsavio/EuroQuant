@@ -4,7 +4,8 @@ import React, { useState, useEffect } from "react";
 import { 
   TrendingUp, TrendingDown, RefreshCw, AlertTriangle, 
   Search, ShieldAlert, Award, FileText, Globe, Cpu, X,
-  Activity, ArrowUpRight, Newspaper, Play, Calendar, Percent
+  Activity, ArrowUpRight, Newspaper, Play, Calendar, Percent,
+  PieChart, Crosshair
 } from "lucide-react";
 import { 
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, 
@@ -34,10 +35,27 @@ interface VolatilitySummary {
   message: string;
 }
 
+interface MetalsSummary {
+  ticker: string;
+  name: string;
+  price: number;
+  change_pct: number;
+}
+
+interface CryptoSummary {
+  ticker: string;
+  name: string;
+  price: number;
+  change_pct: number;
+}
+
 interface MarketSummary {
   indices: IndexSummary[];
   v2tx: VolatilitySummary;
   forex: ForexSummary[];
+  metals: MetalsSummary[];
+  crypto: CryptoSummary[];
+  global_circuit_breaker: boolean;
 }
 
 interface ScreenerRow {
@@ -87,6 +105,8 @@ interface StockDetail {
   stop_loss: number;
   take_profit: number;
   ml_prediction_prob?: number;
+  kelly_factor?: number;
+  chandelier_exit_distance?: number;
 }
 
 interface BrokerAccount {
@@ -274,9 +294,11 @@ export default function TerminalDashboard() {
   const [riskModalValue, setRiskModalValue] = useState("5.0");
 
   // Advanced components states
-  const [mainTab, setMainTab] = useState<"dashboard" | "risk_telemetry" | "correlation" | "backtest" | "audit_log" | "ai_ml">("dashboard");
+  const [mainTab, setMainTab] = useState<"dashboard" | "risk_telemetry" | "correlation" | "backtest" | "audit_log" | "ai_ml" | "system_logs" | "portfolio_weights" | "hedging" | "live_trading" | "asset_config">("dashboard");
   const [correlationData, setCorrelationData] = useState<{ tickers: string[]; matrix: number[][] } | null>(null);
   const [riskAnalytics, setRiskAnalytics] = useState<{ value_at_risk_95: number; sharpe_ratio: number; sortino_ratio: number; max_drawdown: number; equity_curve: any[] } | null>(null);
+  const [stressTest, setStressTest] = useState<{ scenarios: { name: string; max_drawdown: number }[] } | null>(null);
+  const [hedgingBeta, setHedgingBeta] = useState<{ index: string; required_short_lots: number; portfolio_value: number; beta: number } | null>(null);
   const [portfolioBacktestResults, setPortfolioBacktestResults] = useState<any | null>(null);
   const [portfolioBacktestLoading, setPortfolioBacktestLoading] = useState(false);
   const [selectedPortfolioTickers, setSelectedPortfolioTickers] = useState<string[]>([]);
@@ -288,6 +310,14 @@ export default function TerminalDashboard() {
   const [mlMetrics, setMlMetrics] = useState<any[]>([]);
   const [mlMetricsLoading, setMlMetricsLoading] = useState(false);
   const [mlRetraining, setMlRetraining] = useState(false);
+  const [systemLogs, setSystemLogs] = useState<any[]>([]);
+  const [systemLogsLoading, setSystemLogsLoading] = useState(false);
+  const [globalPortfolioWeights, setGlobalPortfolioWeights] = useState<any[]>([]);
+  const [hedgingStrategies, setHedgingStrategies] = useState<any[]>([]);
+  const [livePositions, setLivePositions] = useState<any[]>([]);
+  const [executionLogs, setExecutionLogs] = useState<any[]>([]);
+  const [tickersConfig, setTickersConfig] = useState<any[]>([]);
+  const [newTicker, setNewTicker] = useState({ ticker: "", name: "", country: "USA", sector: "Equities", industry: "" });
 
   // MVO, WFO, and Monte Carlo States
   const [monteCarloResults, setMonteCarloResults] = useState<any | null>(null);
@@ -421,6 +451,16 @@ export default function TerminalDashboard() {
         const data = await riskAnalyticsRes.json();
         setRiskAnalytics(data);
       }
+      
+      const stressRes = await fetch(`${API_URL}/api/mt5/stress-test`);
+      if (stressRes.ok) {
+        setStressTest(await stressRes.json());
+      }
+      
+      const hedgeRes = await fetch(`${API_URL}/api/mt5/hedging/beta`);
+      if (hedgeRes.ok) {
+        setHedgingBeta(await hedgeRes.json());
+      }
 
       // Fetch economic calendar
       try {
@@ -458,6 +498,151 @@ export default function TerminalDashboard() {
       console.error("Error fetching dashboard data:", error);
     }
   };
+
+  const fetchLiveTrading = async () => {
+    try {
+      const token = localStorage.getItem("euroquant_token");
+      if (token) {
+        const resPos = await fetch("http://localhost:8000/api/live-positions", {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const posData = await resPos.json();
+        setLivePositions(posData.positions || []);
+        
+        const resLogs = await fetch("http://localhost:8000/api/execution-logs", {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const logData = await resLogs.json();
+        setExecutionLogs(logData.logs || []);
+      }
+    } catch (error) {
+      console.error("Error fetching live trading data:", error);
+    }
+  };
+
+  useEffect(() => {
+    if (mainTab === "live_trading") {
+      fetchLiveTrading();
+    } else if (mainTab === "asset_config") {
+      fetchTickersConfig();
+    }
+  }, [mainTab]);
+
+  const fetchTickersConfig = async () => {
+    try {
+      const token = localStorage.getItem("euroquant_token");
+      if (token) {
+        const res = await fetch("http://localhost:8000/api/tickers", {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const data = await res.json();
+        setTickersConfig(data || []);
+      }
+    } catch (error) {
+      console.error("Error fetching tickers config:", error);
+    }
+  };
+
+  const toggleTickerStatus = async (ticker: string, currentStatus: boolean) => {
+    try {
+      const token = localStorage.getItem("euroquant_token");
+      if (token) {
+        await fetch("http://localhost:8000/api/tickers/toggle", {
+          method: "POST",
+          headers: { 
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}` 
+          },
+          body: JSON.stringify({ ticker, is_active: !currentStatus })
+        });
+        fetchTickersConfig();
+      }
+    } catch (error) {
+      console.error("Error toggling ticker status:", error);
+    }
+  };
+
+  const submitNewTicker = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      const token = localStorage.getItem("euroquant_token");
+      if (token) {
+        const res = await fetch("http://localhost:8000/api/tickers/add", {
+          method: "POST",
+          headers: { 
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}` 
+          },
+          body: JSON.stringify(newTicker)
+        });
+        if (res.ok) {
+          setNewTicker({ ticker: "", name: "", country: "USA", sector: "Equities", industry: "" });
+          fetchTickersConfig();
+        } else {
+          const err = await res.json();
+          alert("Errore: " + err.detail);
+        }
+      }
+    } catch (error) {
+      console.error("Error adding new ticker:", error);
+    }
+  };
+
+  const fetchHedgingStrategies = async () => {
+    try {
+      const token = localStorage.getItem("euroquant_token");
+      if (token) {
+        const res = await fetch("http://localhost:8000/api/hedging-strategies", {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const data = await res.json();
+        setHedgingStrategies(data.strategies || []);
+      }
+    } catch (error) {
+      console.error("Error fetching hedging strategies:", error);
+    }
+  };
+
+  const fetchPortfolioWeights = async () => {
+    try {
+      const token = localStorage.getItem("euroquant_token");
+      if (token) {
+        const res = await fetch("http://localhost:8000/api/portfolio-weights", {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const data = await res.json();
+        setGlobalPortfolioWeights(data.weights || []);
+      }
+    } catch (error) {
+      console.error("Error fetching portfolio weights:", error);
+    }
+  };
+
+  const fetchSystemLogs = async () => {
+    try {
+      const token = localStorage.getItem("euroquant_token");
+      const res = await fetch(`${API_URL}/api/system-logs?limit=200`, {
+        headers: { "Authorization": `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSystemLogs(data);
+      }
+    } catch (err) {
+      console.error("Error fetching system logs:", err);
+    }
+  };
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (mainTab === "system_logs") {
+      fetchSystemLogs();
+      interval = setInterval(fetchSystemLogs, 3000);
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [mainTab]);
 
   const fetchAuditLogs = async () => {
     setAuditLogsLoading(true);
@@ -976,6 +1161,13 @@ export default function TerminalDashboard() {
           >
             🚨 {emergencyKillSwitch ? "BLOCCO ATTIVO" : "KILL-SWITCH"}
           </button>
+          
+          {/* AI Circuit Breaker (Auto) */}
+          {marketSummary?.global_circuit_breaker && (
+            <div className="px-3 py-2 text-[10px] font-bold uppercase rounded border border-rose-500 bg-rose-600/20 text-rose-400 flex items-center gap-1.5 animate-pulse">
+              ⚠️ AI CIRCUIT BREAKER ON
+            </div>
+          )}
 
           {/* Sync Trigger */}
           <button
@@ -1034,7 +1226,7 @@ export default function TerminalDashboard() {
 
       {/* Forex Ticker Ribbon */}
       {marketSummary && marketSummary.forex && (
-        <div className="bg-terminal-card border border-terminal-border p-2 mb-4 rounded flex items-center overflow-x-auto whitespace-nowrap text-xs gap-6 scrollbar-none">
+        <div className="bg-terminal-card border border-terminal-border p-2 mb-2 rounded flex items-center overflow-x-auto whitespace-nowrap text-xs gap-6 scrollbar-none">
           <span className="text-terminal-accent font-bold tracking-wider shrink-0 border-r border-terminal-border pr-4">FOREX MONITOR:</span>
           {marketSummary.forex.map((fx) => (
             <div key={fx.ticker} className="flex items-center gap-2 shrink-0">
@@ -1043,6 +1235,40 @@ export default function TerminalDashboard() {
               <span className={`flex items-center gap-0.5 ${fx.change_pct >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
                 {fx.change_pct >= 0 ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
                 {fx.change_pct >= 0 ? "+" : ""}{fx.change_pct.toFixed(2)}%
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Metals Ticker Ribbon */}
+      {marketSummary && marketSummary.metals && (
+        <div className="bg-terminal-card border border-terminal-border p-2 mb-2 rounded flex items-center overflow-x-auto whitespace-nowrap text-xs gap-6 scrollbar-none">
+          <span className="text-terminal-accent font-bold tracking-wider shrink-0 border-r border-terminal-border pr-4">METALS (SAFE HAVEN):</span>
+          {marketSummary.metals.map((mtl) => (
+            <div key={mtl.ticker} className="flex items-center gap-2 shrink-0">
+              <span className="text-amber-400 font-bold">{mtl.name}</span>
+              <span className="font-mono font-bold">{mtl.price.toFixed(2)}</span>
+              <span className={`flex items-center gap-0.5 ${mtl.change_pct >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                {mtl.change_pct >= 0 ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
+                {mtl.change_pct >= 0 ? "+" : ""}{mtl.change_pct.toFixed(2)}%
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Crypto Ticker Ribbon */}
+      {marketSummary && marketSummary.crypto && (
+        <div className="bg-terminal-card border border-terminal-border p-2 mb-4 rounded flex items-center overflow-x-auto whitespace-nowrap text-xs gap-6 scrollbar-none">
+          <span className="text-terminal-accent font-bold tracking-wider shrink-0 border-r border-terminal-border pr-4">CRYPTO MONITOR:</span>
+          {marketSummary.crypto.map((crp) => (
+            <div key={crp.ticker} className="flex items-center gap-2 shrink-0">
+              <span className="text-violet-400 font-bold">{crp.name}</span>
+              <span className="font-mono font-bold">{crp.price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
+              <span className={`flex items-center gap-0.5 ${crp.change_pct >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                {crp.change_pct >= 0 ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
+                {crp.change_pct >= 0 ? "+" : ""}{crp.change_pct.toFixed(2)}%
               </span>
             </div>
           ))}
@@ -1110,6 +1336,56 @@ export default function TerminalDashboard() {
           }`}
         >
           🔐 Compliance Audit
+        </button>
+        <button
+          onClick={() => setMainTab("system_logs")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition ${
+            mainTab === "system_logs"
+              ? "bg-terminal-accent text-black font-extrabold shadow-[0_0_8px_rgba(255,153,0,0.3)]"
+              : "text-slate-400 hover:text-white hover:bg-terminal-bg/50"
+          }`}
+        >
+          🖥️ Docker Logs
+        </button>
+        <button
+          onClick={() => setMainTab("portfolio_weights")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition ${
+            mainTab === "portfolio_weights"
+              ? "bg-terminal-accent text-black font-extrabold shadow-[0_0_8px_rgba(255,153,0,0.3)]"
+              : "text-slate-400 hover:text-white hover:bg-terminal-bg/50"
+          }`}
+        >
+          <PieChart className="inline h-3 w-3 mr-1" /> Weights
+        </button>
+        <button
+          onClick={() => setMainTab("hedging")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition ${
+            mainTab === "hedging"
+              ? "bg-terminal-accent text-black font-extrabold shadow-[0_0_8px_rgba(255,153,0,0.3)]"
+              : "text-slate-400 hover:text-white hover:bg-terminal-bg/50"
+          }`}
+        >
+          <ShieldAlert className="inline h-3 w-3 mr-1" /> Hedging
+        </button>
+        <button
+          onClick={() => setMainTab("live_trading")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition ${
+            mainTab === "live_trading"
+              ? "bg-red-500 text-white font-extrabold shadow-[0_0_8px_rgba(239,68,68,0.5)]"
+              : "text-red-400/70 hover:text-red-400 hover:bg-red-500/10"
+          }`}
+        >
+          <Crosshair className="inline h-3 w-3 mr-1 animate-pulse" /> LIVE TRADING
+        </button>
+        <button
+          onClick={() => setMainTab("asset_config")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition ${
+            mainTab === "asset_config"
+              ? "bg-[#00ff66] text-black font-extrabold shadow-[0_0_8px_rgba(0,255,102,0.3)]"
+              : "text-slate-400 hover:text-white hover:bg-terminal-bg/50"
+          }`}
+        >
+          <Search className="inline h-3 w-3 mr-1" /> Asset Config
         </button>
       </div>
 
@@ -1880,6 +2156,54 @@ export default function TerminalDashboard() {
                 </div>
               )}
             </div>
+
+            {/* New Panel for Stress Test & Hedging */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+              {/* Stress Test */}
+              <div className="bg-terminal-card border border-terminal-border p-4 rounded flex-1 flex flex-col">
+                <h2 className="text-xs font-black uppercase text-slate-400 mb-3 border-b border-terminal-border pb-2 flex items-center gap-2">
+                  🏛 Historical Stress Test (Portfolio: €{hedgingBeta?.portfolio_value || 0})
+                </h2>
+                {stressTest ? (
+                  <div className="flex flex-col gap-2">
+                    {stressTest.scenarios.map((s, idx) => (
+                      <div key={idx} className="flex items-center justify-between bg-terminal-bg border border-terminal-border p-2 rounded">
+                        <span className="text-[10px] text-slate-300 font-bold">{s.name}</span>
+                        <span className="text-xs font-mono font-black text-rose-500">{s.max_drawdown.toFixed(1)}%</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="text-xs text-terminal-muted">Caricamento stress test...</div>
+                )}
+              </div>
+
+              {/* Hedging Beta */}
+              <div className="bg-terminal-card border border-terminal-border p-4 rounded flex-1 flex flex-col">
+                <h2 className="text-xs font-black uppercase text-slate-400 mb-3 border-b border-terminal-border pb-2 flex items-center gap-2">
+                  🛡 Dynamic Hedging (Beta Neutral)
+                </h2>
+                {hedgingBeta ? (
+                  <div className="flex flex-col gap-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] text-slate-500 uppercase font-bold">Hedge Index</span>
+                      <span className="text-xs text-slate-200 font-bold">{hedgingBeta.index}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] text-slate-500 uppercase font-bold">Portfolio Beta</span>
+                      <span className="text-xs text-amber-500 font-mono font-bold">{hedgingBeta.beta.toFixed(2)}</span>
+                    </div>
+                    <div className="flex items-center justify-between bg-terminal-bg border border-terminal-border p-2 rounded">
+                      <span className="text-xs text-slate-300 font-bold">Recommended Short Lots</span>
+                      <span className="text-sm font-mono font-black text-emerald-400">{hedgingBeta.required_short_lots}</span>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-xs text-terminal-muted">Caricamento hedging...</div>
+                )}
+              </div>
+            </div>
+
           </div>
         </div>
       )}
@@ -2526,6 +2850,232 @@ export default function TerminalDashboard() {
         </div>
       )}
 
+      {mainTab === "portfolio_weights" && (
+        <div className="bg-terminal-card border border-terminal-border p-4 rounded flex flex-col flex-1 min-h-[500px]">
+          <div className="flex justify-between items-center border-b border-terminal-border pb-3 mb-4">
+            <div>
+              <h2 className="text-xs font-black uppercase text-slate-200 flex items-center gap-1.5">
+                <PieChart className="h-4 w-4 text-terminal-accent" />
+                Portfolio Optimization (Markowitz MVO)
+              </h2>
+              <p className="text-[10px] text-slate-400 mt-1">
+                Asset allocation ottimizzata per Max Sharpe Ratio calcolata dal motore quantistico
+              </p>
+            </div>
+            <button
+              onClick={fetchPortfolioWeights}
+              className="bg-terminal-bg border border-terminal-border hover:border-terminal-accent text-slate-300 hover:text-white px-3 py-1.5 rounded text-[10px] font-bold transition flex items-center gap-1.5"
+            >
+              <RefreshCw className="h-3 w-3" />
+              AGGIORNA
+            </button>
+          </div>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {globalPortfolioWeights.length === 0 ? (
+              <div className="text-slate-500 italic col-span-3 p-4 bg-terminal-bg rounded border border-terminal-border">
+                Nessun peso calcolato di recente. Il worker deve ancora terminare l'ottimizzazione.
+              </div>
+            ) : (
+              globalPortfolioWeights.map((w: any) => (
+                <div key={w.ticker} className="bg-terminal-bg border border-terminal-border/50 rounded p-3 flex flex-col gap-2 relative overflow-hidden group">
+                  <div className="absolute top-0 left-0 h-full bg-terminal-accent/10 transition-all duration-500 ease-out" style={{ width: `${w.weight * 100}%` }}></div>
+                  <div className="flex justify-between items-center z-10">
+                    <span className="text-white font-black text-sm">{w.ticker}</span>
+                    <span className="text-terminal-accent font-bold text-lg">{(w.weight * 100).toFixed(1)}%</span>
+                  </div>
+                  <div className="flex flex-col z-10">
+                    <span className="text-slate-400 text-[10px] truncate">{w.name}</span>
+                    <span className="text-slate-500 text-[9px] uppercase tracking-wider">{w.sector}</span>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+
+      {mainTab === "hedging" && (
+        <div className="bg-terminal-card border border-terminal-border p-4 rounded flex flex-col flex-1 min-h-[500px]">
+          <div className="flex justify-between items-center border-b border-terminal-border pb-3 mb-4">
+            <div>
+              <h2 className="text-xs font-black uppercase text-slate-200 flex items-center gap-1.5">
+                <ShieldAlert className="h-4 w-4 text-terminal-accent" />
+                Black-Scholes Options Hedging
+              </h2>
+              <p className="text-[10px] text-slate-400 mt-1">
+                Suggerimenti per opzioni Put difensive calcolate in scenari di alta volatilità
+              </p>
+            </div>
+            <button
+              onClick={fetchHedgingStrategies}
+              className="bg-terminal-bg border border-terminal-border hover:border-terminal-accent text-slate-300 hover:text-white px-3 py-1.5 rounded text-[10px] font-bold transition flex items-center gap-1.5"
+            >
+              <RefreshCw className="h-3 w-3" />
+              AGGIORNA
+            </button>
+          </div>
+          
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-2 gap-4">
+            {hedgingStrategies.length === 0 ? (
+              <div className="text-slate-500 italic col-span-2 p-4 bg-terminal-bg rounded border border-terminal-border">
+                Nessuna strategia di Hedging attiva. La volatilità di mercato (V2TX) è sotto la soglia di allerta.
+              </div>
+            ) : (
+              hedgingStrategies.map((s: any, idx: number) => (
+                <div key={`${s.ticker}-${s.option_type}-${idx}`} className="bg-terminal-bg border border-terminal-border rounded p-4 flex flex-col gap-3">
+                  <div className="flex justify-between items-center border-b border-slate-700/50 pb-2">
+                    <span className="text-white font-black text-lg">{s.ticker} <span className="text-xs text-slate-400 font-normal ml-1">{s.name}</span></span>
+                    <span className="text-terminal-accent font-bold px-2 py-0.5 bg-terminal-accent/10 rounded text-xs border border-terminal-accent/30">{s.option_type}</span>
+                  </div>
+                  
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
+                    <div className="flex justify-between"><span className="text-slate-500">Strike Price:</span> <span className="text-slate-200 font-mono">€ {s.strike.toFixed(2)}</span></div>
+                    <div className="flex justify-between"><span className="text-slate-500">Scadenza:</span> <span className="text-slate-200 font-mono">{s.expiry_days} Giorni</span></div>
+                    <div className="flex justify-between"><span className="text-slate-500">Prezzo B-S:</span> <span className="text-red-400 font-mono font-bold">€ {s.theoretical_price.toFixed(4)}</span></div>
+                  </div>
+                  
+                  <div className="mt-2 pt-2 border-t border-slate-700/50 grid grid-cols-4 gap-2 text-[10px]">
+                    <div className="flex flex-col items-center"><span className="text-slate-500 uppercase">Delta</span><span className="text-slate-300 font-mono">{s.delta ? s.delta.toFixed(4) : 'N/A'}</span></div>
+                    <div className="flex flex-col items-center"><span className="text-slate-500 uppercase">Gamma</span><span className="text-slate-300 font-mono">{s.gamma ? s.gamma.toFixed(4) : 'N/A'}</span></div>
+                    <div className="flex flex-col items-center"><span className="text-slate-500 uppercase">Theta</span><span className="text-slate-300 font-mono">{s.theta ? s.theta.toFixed(4) : 'N/A'}</span></div>
+                    <div className="flex flex-col items-center"><span className="text-slate-500 uppercase">Vega</span><span className="text-slate-300 font-mono">{s.vega ? s.vega.toFixed(4) : 'N/A'}</span></div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+
+      {mainTab === "live_trading" && (
+        <div className="bg-terminal-card border border-terminal-border p-4 rounded flex flex-col flex-1 min-h-[500px]">
+          <div className="flex justify-between items-center border-b border-terminal-border pb-3 mb-4">
+            <div>
+              <h2 className="text-xs font-black uppercase text-red-500 flex items-center gap-1.5 animate-pulse">
+                <Crosshair className="h-4 w-4" />
+                EuroQuant Live Execution Engine
+              </h2>
+              <p className="text-[10px] text-slate-400 mt-1">
+                Portafoglio reale e storico ordini eseguiti sul broker istituzionale
+              </p>
+            </div>
+            <button
+              onClick={fetchLiveTrading}
+              className="bg-terminal-bg border border-terminal-border hover:border-terminal-accent text-slate-300 hover:text-white px-3 py-1.5 rounded text-[10px] font-bold transition flex items-center gap-1.5"
+            >
+              <RefreshCw className="h-3 w-3" />
+              SINC PORTAFOGLIO
+            </button>
+          </div>
+          
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Live Positions */}
+            <div className="flex flex-col gap-3">
+              <h3 className="text-xs font-black text-white border-b border-slate-700/50 pb-2">POSIZIONI APERTE</h3>
+              {livePositions.length === 0 ? (
+                <div className="text-slate-500 italic p-4 bg-terminal-bg rounded border border-terminal-border text-sm text-center">
+                  Nessuna posizione aperta sul broker.
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {livePositions.map((p: any) => (
+                    <div key={p.ticker} className="flex justify-between items-center bg-terminal-bg border border-slate-700/50 p-3 rounded">
+                      <div className="flex flex-col">
+                        <span className="font-bold text-white text-sm">{p.ticker} <span className="text-xs font-normal text-slate-500 ml-1">{p.name}</span></span>
+                        <span className="text-xs text-slate-400">Qty: <span className="font-mono text-slate-200">{p.quantity}</span> @ <span className="font-mono text-slate-200">€{p.avg_price.toFixed(2)}</span></span>
+                      </div>
+                      <div className="flex flex-col items-end">
+                        <span className="text-xs text-slate-500 uppercase">Unrealized P&L</span>
+                        <span className={`font-mono font-bold ${p.unrealized_pnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+                          {p.unrealized_pnl >= 0 ? '+' : ''}€{p.unrealized_pnl.toFixed(2)}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+            
+            {/* Execution Logs */}
+            <div className="flex flex-col gap-3">
+              <h3 className="text-xs font-black text-white border-b border-slate-700/50 pb-2">ULTIMI ORDINI ESEGUITI</h3>
+              {executionLogs.length === 0 ? (
+                <div className="text-slate-500 italic p-4 bg-terminal-bg rounded border border-terminal-border text-sm text-center">
+                  Nessun ordine eseguito di recente.
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
+                  {executionLogs.map((l: any) => (
+                    <div key={l.id} className="flex justify-between items-center bg-terminal-bg border border-slate-700/50 p-2 rounded text-xs">
+                      <div className="flex items-center gap-3">
+                        <span className={`font-black px-2 py-0.5 rounded ${l.action === 'BUY' ? 'bg-green-500/20 text-green-400' : 'bg-red-500/20 text-red-400'}`}>
+                          {l.action}
+                        </span>
+                        <span className="font-bold text-slate-200">{l.ticker}</span>
+                      </div>
+                      <div className="flex items-center gap-4">
+                        <span className="font-mono text-slate-400">{l.quantity} px @ €{l.fill_price.toFixed(2)}</span>
+                        <span className="text-slate-500 text-[9px]">{new Date(l.timestamp).toLocaleTimeString()}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {mainTab === "system_logs" && (
+        <div className="bg-terminal-card border border-terminal-border p-4 rounded flex flex-col flex-1 min-h-[500px]">
+          <div className="flex justify-between items-center border-b border-terminal-border pb-3 mb-4">
+            <div>
+              <h2 className="text-xs font-black uppercase text-slate-200 flex items-center gap-1.5">
+                🖥️ Docker Terminal Logs
+              </h2>
+              <p className="text-[10px] text-slate-400 mt-1">
+                Monitor in tempo reale delle attività dei container in background (Worker, NLP, Sync)
+              </p>
+            </div>
+            <button
+              onClick={fetchSystemLogs}
+              className="bg-terminal-bg border border-terminal-border hover:border-terminal-accent text-slate-300 hover:text-white px-3 py-1.5 rounded text-[10px] font-bold transition flex items-center gap-1.5"
+            >
+              <RefreshCw className="h-3 w-3" />
+              AGGIORNA
+            </button>
+          </div>
+          
+          <div className="flex-1 bg-black rounded p-3 font-mono text-[10px] overflow-y-auto border border-terminal-border/30">
+            {systemLogs.length === 0 ? (
+              <div className="text-slate-500 italic">Nessun log presente...</div>
+            ) : (
+              <div className="flex flex-col gap-1">
+                {systemLogs.map((log) => (
+                  <div key={log.id} className="flex gap-2">
+                    <span className="text-slate-500 shrink-0">
+                      {log.timestamp.replace("T", " ").substring(0, 19)}
+                    </span>
+                    <span className={`shrink-0 w-12 font-bold ${
+                      log.level === "ERROR" ? "text-rose-500" :
+                      log.level === "WARN" ? "text-amber-500" :
+                      "text-emerald-500"
+                    }`}>
+                      [{log.level}]
+                    </span>
+                    <span className="text-slate-400 shrink-0 w-16">[{log.source}]</span>
+                    <span className={`${log.level === "ERROR" ? "text-rose-400 font-bold" : "text-slate-300"}`}>
+                      {log.message}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* 4. Stock Detail Modal (Explainable AI reasoning) */}
       {selectedTicker && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50 animate-fadeIn">
@@ -2842,7 +3392,7 @@ export default function TerminalDashboard() {
                       </h4>
                     </div>
 
-                    <div className="grid grid-cols-5 gap-2 text-center text-[10px]">
+                    <div className="grid grid-cols-6 gap-2 text-center text-[10px]">
                       <div className="bg-terminal-card border border-terminal-border p-1.5 rounded">
                         <span className="text-[8px] text-terminal-muted block uppercase">MT5 Symbol</span>
                         <span className="font-mono text-[10px] font-black text-white">{stockDetail.mt5_symbol}</span>
@@ -2860,7 +3410,13 @@ export default function TerminalDashboard() {
                         </span>
                       </div>
                       <div className="bg-terminal-card border border-terminal-border p-1.5 rounded">
-                        <span className="text-[8px] text-terminal-muted block uppercase">Stop Loss (SL)</span>
+                        <span className="text-[8px] text-terminal-muted block uppercase">Kelly Sizing</span>
+                        <span className="font-mono text-[10px] font-black text-amber-400">
+                          ⚖️ {stockDetail.kelly_factor ? `${(stockDetail.kelly_factor * 100).toFixed(1)}%` : "N/D"}
+                        </span>
+                      </div>
+                      <div className="bg-terminal-card border border-terminal-border p-1.5 rounded">
+                        <span className="text-[8px] text-terminal-muted block uppercase">Chandelier Exit SL</span>
                         <span className="font-mono text-[10px] font-bold text-rose-400">
                           {stockDetail.stop_loss > 0 ? stockDetail.stop_loss.toFixed(4) : "N/D"}
                         </span>
@@ -3255,6 +3811,124 @@ if (res > 0) {
               <span>Generato il (Zulu): {stockDetail && stockDetail.history.length > 0 ? stockDetail.history[stockDetail.history.length-1].date + " Z" : ""}</span>
             </div>
             
+          </div>
+        </div>
+      )}
+
+      {mainTab === "asset_config" && (
+        <div className="flex flex-col gap-3 flex-1 h-[calc(100vh-140px)]">
+          <div className="bg-terminal-card border border-terminal-border p-4 rounded shrink-0">
+            <h2 className="text-sm font-black uppercase text-[#00ff66] mb-4 flex items-center gap-2">
+              <Search className="h-5 w-5" /> Aggiungi Nuovo Ticker
+            </h2>
+            <form onSubmit={submitNewTicker} className="flex gap-4 items-end">
+              <div className="flex-1">
+                <label className="block text-xs uppercase text-slate-400 mb-1">Simbolo (es. US500, AAPL, BTCUSD)</label>
+                <input 
+                  type="text" 
+                  value={newTicker.ticker} 
+                  onChange={(e) => setNewTicker({...newTicker, ticker: e.target.value.toUpperCase()})}
+                  className="w-full bg-terminal-bg border border-terminal-border focus:border-[#00ff66] focus:outline-none rounded px-3 py-1.5 text-sm text-white uppercase"
+                  required
+                />
+              </div>
+              <div className="flex-1">
+                <label className="block text-xs uppercase text-slate-400 mb-1">Nome Azienda / Asset</label>
+                <input 
+                  type="text" 
+                  value={newTicker.name} 
+                  onChange={(e) => setNewTicker({...newTicker, name: e.target.value})}
+                  className="w-full bg-terminal-bg border border-terminal-border focus:border-[#00ff66] focus:outline-none rounded px-3 py-1.5 text-sm text-white"
+                  required
+                />
+              </div>
+              <div className="flex-1">
+                <label className="block text-xs uppercase text-slate-400 mb-1">Mercato (es. USA, Europe, Crypto)</label>
+                <input 
+                  type="text" 
+                  value={newTicker.country} 
+                  onChange={(e) => setNewTicker({...newTicker, country: e.target.value})}
+                  className="w-full bg-terminal-bg border border-terminal-border focus:border-[#00ff66] focus:outline-none rounded px-3 py-1.5 text-sm text-white"
+                  required
+                />
+              </div>
+              <div className="flex-1">
+                <label className="block text-xs uppercase text-slate-400 mb-1">Settore (es. Index, Technology, Crypto)</label>
+                <input 
+                  type="text" 
+                  value={newTicker.sector} 
+                  onChange={(e) => setNewTicker({...newTicker, sector: e.target.value})}
+                  className="w-full bg-terminal-bg border border-terminal-border focus:border-[#00ff66] focus:outline-none rounded px-3 py-1.5 text-sm text-white"
+                  required
+                />
+              </div>
+              <button 
+                type="submit" 
+                className="bg-[#00ff66] text-black font-bold py-1.5 px-6 rounded text-sm uppercase tracking-wider hover:bg-[#00e55c] transition"
+              >
+                + Aggiungi
+              </button>
+            </form>
+          </div>
+
+          <div className="bg-terminal-card border border-terminal-border rounded flex-1 flex flex-col overflow-hidden">
+            <div className="p-3 border-b border-terminal-border bg-terminal-bg/50 flex justify-between items-center">
+              <h2 className="text-xs font-black uppercase text-slate-400 flex items-center gap-2">
+                <Activity className="h-4 w-4" /> Configurazione Asset Monitorati
+              </h2>
+              <button onClick={fetchTickersConfig} className="text-slate-400 hover:text-white transition">
+                <RefreshCw className="h-4 w-4" />
+              </button>
+            </div>
+            
+            <div className="flex-1 overflow-auto custom-scrollbar p-3">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-terminal-border/50 text-slate-500 uppercase tracking-wider">
+                    <th className="p-2 font-medium">Stato</th>
+                    <th className="p-2 font-medium">Ticker</th>
+                    <th className="p-2 font-medium">Nome</th>
+                    <th className="p-2 font-medium">Mercato</th>
+                    <th className="p-2 font-medium">Settore</th>
+                    <th className="p-2 font-medium text-center">Azione</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-terminal-border/30">
+                  {tickersConfig.map((t, idx) => (
+                    <tr key={idx} className="hover:bg-terminal-bg/30 transition-colors group">
+                      <td className="p-2">
+                        {t.is_active ? (
+                          <span className="text-[#00ff66] font-bold">● ATTIVO</span>
+                        ) : (
+                          <span className="text-rose-500 font-bold">○ DISATTIVO</span>
+                        )}
+                      </td>
+                      <td className={`p-2 font-bold font-mono ${t.is_active ? 'text-white' : 'text-slate-500'}`}>{t.ticker}</td>
+                      <td className={`p-2 ${t.is_active ? 'text-slate-300' : 'text-slate-500'}`}>{t.name}</td>
+                      <td className={`p-2 ${t.is_active ? 'text-slate-400' : 'text-slate-600'}`}>{t.country}</td>
+                      <td className={`p-2 ${t.is_active ? 'text-slate-400' : 'text-slate-600'}`}>{t.sector}</td>
+                      <td className="p-2 text-center">
+                        <button
+                          onClick={() => toggleTickerStatus(t.ticker, t.is_active)}
+                          className={`px-3 py-1 rounded text-xs font-bold uppercase transition ${
+                            t.is_active 
+                              ? 'bg-rose-500/20 text-rose-500 hover:bg-rose-500 hover:text-white' 
+                              : 'bg-[#00ff66]/20 text-[#00ff66] hover:bg-[#00ff66] hover:text-black'
+                          }`}
+                        >
+                          {t.is_active ? 'Disattiva' : 'Riattiva'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {tickersConfig.length === 0 && (
+                    <tr>
+                      <td colSpan={6} className="p-4 text-center text-slate-500 italic">Nessun asset configurato.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}

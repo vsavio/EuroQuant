@@ -48,7 +48,7 @@ def download_ticker_history_with_retry(ticker_clean, start, end):
 def _ensure_index_in_companies(ticker, name, db):
     """Ensures index/V2TX ticker exists as a row in the companies table."""
     existing = db.execute(
-        text("SELECT ticker FROM companies WHERE ticker = :ticker"),
+        text("SELECT ticker FROM companies WHERE ticker = :ticker AND is_active = TRUE"),
         {"ticker": ticker}
     ).fetchone()
     if not existing:
@@ -72,11 +72,11 @@ def fetch_and_calculate_all():
     db = SessionLocal()
     try:
         # Get active tickers
-        res = db.execute(text("SELECT ticker FROM companies"))
+        res = db.execute(text("SELECT ticker FROM companies WHERE is_active = TRUE"))
         tickers = [row[0] for row in res.fetchall()]
         
         # Add index tickers to list
-        all_tickers = tickers + list(INDICES.keys()) + ["^V2TX"]
+        all_tickers = tickers + list(INDICES.keys()) + ["^V2TX", "^TNX"]
         
         print(f"Quantitative Engine: Fetching prices for {len(all_tickers)} instruments...")
         
@@ -223,6 +223,8 @@ def fetch_and_calculate_all():
                         index_name = INDICES.get(ticker, ticker)
                         if ticker == "^V2TX":
                             index_name = "VSTOXX Volatility Index"
+                        elif ticker == "^TNX":
+                            index_name = "US 10-Year Treasury Yield"
                         _ensure_index_in_companies(ticker, index_name, db)
                         db.execute(
                             text("""

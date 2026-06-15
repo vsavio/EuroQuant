@@ -5,9 +5,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from sqlalchemy import text
 from database import SessionLocal
-from config import OLLAMA_HOST, V2TX_THRESHOLD
+from config import OLLAMA_HOST, V2TX_THRESHOLD, USE_DEEP_LEARNING, USE_REINFORCEMENT_LEARNING
 from nlp import calculate_decayed_sentiment
 from ml_engine import train_and_predict_direction
+from dl_engine import train_and_predict_dl
+from rl_engine import train_rl_agent
 
 # Structured JSON logger
 logging.basicConfig(
@@ -56,6 +58,17 @@ def get_latest_price_metrics(ticker, db):
     else:
         volatility_lot_sizing = 1.0
         
+    vwap_query = text("""
+        SELECT SUM(close * volume) / NULLIF(SUM(volume), 0)
+        FROM (
+            SELECT close, volume FROM stock_prices 
+            WHERE ticker = :ticker AND close IS NOT NULL AND volume IS NOT NULL
+            ORDER BY timestamp DESC 
+            LIMIT 20
+        ) sub
+    """)
+    vwap_20d = db.execute(vwap_query, {"ticker": ticker}).scalar()
+
     return {
         "close": float(latest[0]) if latest[0] else None,
         "open": float(latest[1]) if latest[1] else None,
@@ -72,7 +85,8 @@ def get_latest_price_metrics(ticker, db):
         "adx": float(latest[12]) if (len(latest) > 12 and latest[12] is not None) else None,
         "atr": current_atr,
         "volatility_lot_sizing": volatility_lot_sizing,
-        "price_change_24h": price_change_pct
+        "price_change_24h": price_change_pct,
+        "vwap_20d": float(vwap_20d) if vwap_20d else None
     }
 
 def get_latest_v2tx_from_db(db):
@@ -188,6 +202,7 @@ Asset: {company_name} ({ticker})
   * SMA 20: € {metrics.get('sma_20')}
   * SMA 50: € {metrics.get('sma_50')}
   * SMA 200: € {metrics.get('sma_200')}
+  * VWAP (20-Day): € {f"{metrics.get('vwap_20d'):.2f}" if metrics.get('vwap_20d') else "N/A"}
 - Aggregated Sentiment (24h-48h Decayed): {sentiment:.4f}
 - VSTOXX Volatility Index (V2TX): {v2tx:.2f}
 - Recent News Context:
@@ -324,12 +339,33 @@ def _process_single_company(comp, v2tx, db_url):
         ).fetchone()
         prev_signal = prev_row[0] if prev_row else None
 
+        # 6c. Reinforcement Learning (if enabled)
+        rl_action = "N/A"
+        
         # 7. Train ML model
         try:
             ml_prob = train_and_predict_direction(ticker, db)
+            
+            # 6b. PyTorch Deep Learning LSTM Pipeline (if enabled)
+            if USE_DEEP_LEARNING:
+                dl_prob = train_and_predict_dl(ticker, db)
+                ml_prob = (ml_prob + dl_prob) / 2.0  # Ensemble blending
+                log.info(json.dumps({"ticker": ticker, "event": "ml_ensemble_computed", "gb_prob": round(ml_prob*2-dl_prob, 4), "lstm_prob": round(dl_prob, 4), "final_prob": round(ml_prob, 4)}))
+            else:
+                log.info(json.dumps({"ticker": ticker, "event": "ml_prob_computed", "prob": round(ml_prob, 4)}))
+                
+            if USE_REINFORCEMENT_LEARNING:
+                try:
+                    rl_action = train_rl_agent(ticker, db)
+                    log.info(json.dumps({"ticker": ticker, "event": "rl_computed", "action": rl_action}))
+                except Exception as rl_err:
+                    log.warning(json.dumps({"ticker": ticker, "event": "rl_failed", "error": str(rl_err)}))
         except Exception as ml_err:
             log.warning(json.dumps({"ticker": ticker, "event": "ml_failed", "error": str(ml_err)}))
             ml_prob = 0.50
+            
+        if USE_REINFORCEMENT_LEARNING and rl_action != "N/A":
+            full_reason += f"\n\nRL Agent (DQN): {rl_action}"
 
         # 8. Persist to database
         db.execute(

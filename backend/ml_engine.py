@@ -31,12 +31,17 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     # ─── Volatility proxy ─────────────────────────────────────────────────────
     df["rolling_std_10d"] = df["close"].pct_change().rolling(10).std()
 
-    # ─── Volume ratio (current vs 20d average) ────────────────────────────────
+    # ─── Volume ratio and VWAP ────────────────────────────────────────────────
     if "volume" in df.columns:
         avg_vol = df["volume"].rolling(20).mean().replace(0, np.nan)
         df["volume_ratio"] = df["volume"] / avg_vol
+        
+        # 20-day Rolling Volume Weighted Average Price (VWAP)
+        vwap_20d = (df["close"] * df["volume"]).rolling(20).sum() / df["volume"].rolling(20).sum().replace(0, np.nan)
+        df["price_to_vwap"] = (df["close"] - vwap_20d) / vwap_20d.replace(0, np.nan)
     else:
         df["volume_ratio"] = 1.0
+        df["price_to_vwap"] = 0.0
 
     # ─── Bollinger Band position (0 = lower band, 1 = upper band) ─────────────
     rolling_mean = df["close"].rolling(20).mean()
@@ -125,7 +130,7 @@ def train_and_predict_direction(ticker: str, db) -> float:
         "rsi", "macd_spread", "price_to_sma20", "price_to_sma50", "price_to_sma200",
         "adx", "atr_pct", "momentum_5d", "momentum_10d", "momentum_20d",
         "rolling_std_10d", "volume_ratio", "bb_position", "price_velocity",
-        "sma20_above_sma50", "sma50_above_sma200", "sentiment_score"
+        "sma20_above_sma50", "sma50_above_sma200", "sentiment_score", "price_to_vwap"
     ]
 
     # Explicitly cast all feature columns to float64 to prevent object-type arrays in numpy/sklearn

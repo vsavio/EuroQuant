@@ -14,21 +14,15 @@ CTrade trade;
 
 //--- Input Parameters
 input group "=== EUROQUANT API SETTINGS ==="
-input string   InpApiUrl            = "http://localhost:8000/api/mt5/signals"; // API Endpoint URL (lista completa)
+input string   InpApiUrl            = "http://127.0.0.1:8000/api/mt5/signals"; // API Endpoint URL (lista completa)
 input int      InpCheckIntervalSecs = 120;                                     // Frequenza controllo API (in secondi)
 
+input group "=== TRADING SESSIONS ==="
+input int      InpTradeStartHour    = 0;                                       // Ora inizio trading (0-23)
+input int      InpTradeEndHour      = 24;                                      // Ora fine trading (0-24)
+
 input group "=== RISK & POSITION MANAGEMENT ==="
-enum ENUM_SIZING_MODE {
-   SIZING_MIN_LOT_MULTIPLIER = 0, // Moltiplicatore del Lotto Minimo (Default)
-   SIZING_RISK_PERCENT = 1,       // % Rischio sul Capitale per trade (Richiede Stop Loss)
-   SIZING_MARGIN_PERCENT = 2      // % Margine sul Capitale per trade
-};
-input ENUM_SIZING_MODE InpSizingMode        = SIZING_MIN_LOT_MULTIPLIER;               // Modalità Calcolo Lotto
-input double   InpLotMultiplier     = 1.0;                                     // Quota/Moltiplicatore rispetto al lotto minimo (se Modalità = Lotto Minimo)
-input double   InpRiskPercent       = 1.0;                                     // % di Rischio sul Capitale per operazione (se Modalità = Risk %)
-input double   InpMarginPercent     = 5.0;                                     // % di Margine sul Capitale per operazione (se Modalità = Margine %)
-input bool     InpEnablePartialClose = true;                                   // Abilita Chiusura Parziale (TP1) & Break-Even
-input double   InpPartialCloseAtrMultiplier = 1.5;                             // Moltiplicatore ATR per target TP1 (parziale)
+input double   InpLotMultiplier     = 1.0;                                     // Quota/Moltiplicatore rispetto al lotto minimo di ciascun simbolo
 input ulong    InpMagicNumber       = 20260620;                                // Magic Number per identificare le posizioni
 input int      InpMaxSpreadPoints   = 50;                                      // Spread massimo consentito in punti (se InpMaxSpreadPercent <= 0)
 input double   InpMaxSpreadPercent  = 0.25;                                    // Spread massimo consentito in % del prezzo (0 per disabilitare)
@@ -39,8 +33,12 @@ input bool     InpSendAlerts        = true;                                    /
 
 input group "=== TRAILING STOP SETTINGS ==="
 input bool     InpUseTrailingStop   = true;                                    // Abilita Trailing Stop
-input int      InpTrailingStopPoints = 150;                                     // Punti per Trailing Stop
-input int      InpTrailingStepPoints = 50;                                      // Step per Trailing Stop
+input bool     InpUseBreakEven      = true;                                    // Abilita Break-Even (Secure profit)
+input bool     InpEnablePartialClose= true;                                    // Chiudi 50% al Break-Even
+input double   InpBreakEvenAtrMult  = 1.0;                                     // Moltiplicatore ATR per attivare Break-Even
+input double   InpBreakEvenFallbackPct = 0.3;                                  // Fallback profitto % per Break-Even
+input int      InpTrailingStopPoints = 150;                                    // Punti statici (fallback se no ATR)
+input int      InpTrailingStepPoints = 50;                                     // Step statico (fallback se no ATR)
 
 input group "=== ACCOUNT SAFEGUARD SETTINGS ==="
 input double   InpMaxDailyLossPercent = 2.0;                                    // Max perdita giornaliera consentita (%)
@@ -62,6 +60,7 @@ input string   InpForexSuffix       = "";                                      /
 double   starting_equity = 0.0;
 bool     safeguard_tripped = false;
 datetime last_check_time = 0;
+datetime last_sync_time = 0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -96,7 +95,7 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTimer()
 {
-   datetime now = TimeCurrent();
+   datetime now = TimeLocal();
    
    // Perform Safeguard Check
    CheckSafeguards();
@@ -116,6 +115,13 @@ void OnTimer()
    
    // Update Graphic Dashboard Panel
    DrawDashboard();
+   
+   // Sync positions to Docker Backend
+   if(now - last_sync_time >= 5)
+   {
+       last_sync_time = now;
+       SyncLivePositions();
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -245,6 +251,15 @@ string ResolveMt5Symbol(string ticker, string base_symbol)
 //+------------------------------------------------------------------+
 void ProcessSingleSignal(string json_obj)
 {
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   bool is_trading_hour = false;
+   if(InpTradeEndHour <= InpTradeStartHour) {
+      if(dt.hour >= InpTradeStartHour || dt.hour < InpTradeEndHour) is_trading_hour = true;
+   } else {
+      if(dt.hour >= InpTradeStartHour && dt.hour < InpTradeEndHour) is_trading_hour = true;
+   }
+
    string ticker = GetJsonValue(json_obj, "ticker");
    string raw_symbol = GetJsonValue(json_obj, "mt5_symbol");
    string symbol = ResolveMt5Symbol(ticker, raw_symbol);
@@ -285,103 +300,35 @@ void ProcessSingleSignal(string json_obj)
    // Count open positions for this magic number and symbol
    bool has_buy = false;
    bool has_sell = false;
-       for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
-       ulong ticket = PositionGetTicket(i);
-       if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber && PositionGetString(POSITION_SYMBOL) == symbol)
-       {
-          long pos_type = PositionGetInteger(POSITION_TYPE);
-          if(pos_type == POSITION_TYPE_BUY)
-          {
-             has_buy = true;
-             if(action == "SELL" || action == "CLOSE_ALL")
-             {
-                trade.PositionClose(ticket);
-                Print("[EuroQuant Multi-Bridge] Chiusa posizione BUY su ", symbol, " per segnale ", action, ".");
-                has_buy = false;
-             }
-             else if(InpEnablePartialClose)
-             {
-                double pos_open = PositionGetDouble(POSITION_PRICE_OPEN);
-                double pos_sl = PositionGetDouble(POSITION_PRICE_SL);
-                double pos_vol = PositionGetDouble(POSITION_VOLUME);
-                double current_bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-                double sl_dist = (pos_sl > 0) ? MathAbs(pos_open - pos_sl) : MathAbs(pos_open - stop_loss);
-                
-                if(sl_dist > 0 && pos_sl < pos_open)
-                {
-                   double tp1_price = pos_open + InpPartialCloseAtrMultiplier * sl_dist;
-                   if(current_bid >= tp1_price)
-                   {
-                      double min_lot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-                      double lot_step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-                      double close_vol = pos_vol / 2.0;
-                      if(lot_step > 0)
-                         close_vol = MathRound(close_vol / lot_step) * lot_step;
-                      if(close_vol < min_lot) close_vol = min_lot;
-                      
-                      if(close_vol < pos_vol)
-                      {
-                         if(trade.PositionClose(ticket, close_vol))
-                         {
-                            Print("[EuroQuant Multi-Bridge] TP1 Raggiunto su BUY ", symbol, ". Chiusura parziale di ", DoubleToString(close_vol, 2), " lotti.");
-                            double current_tp = PositionGetDouble(POSITION_TP);
-                            trade.PositionModify(ticket, pos_open, current_tp);
-                         }
-                      }
-                   }
-                }
-             }
-          }
-          else if(pos_type == POSITION_TYPE_SELL)
-          {
-             has_sell = true;
-             if(action == "BUY" || action == "CLOSE_ALL")
-             {
-                trade.PositionClose(ticket);
-                Print("[EuroQuant Multi-Bridge] Chiusa posizione SELL su ", symbol, " per segnale ", action, ".");
-                has_sell = false;
-             }
-             else if(InpEnablePartialClose)
-             {
-                double pos_open = PositionGetDouble(POSITION_PRICE_OPEN);
-                double pos_sl = PositionGetDouble(POSITION_PRICE_SL);
-                double pos_vol = PositionGetDouble(POSITION_VOLUME);
-                double current_ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-                double sl_dist = (pos_sl > 0) ? MathAbs(pos_open - pos_sl) : MathAbs(pos_open - stop_loss);
-                
-                if(sl_dist > 0 && (pos_sl > pos_open || pos_sl == 0))
-                {
-                   double tp1_price = pos_open - InpPartialCloseAtrMultiplier * sl_dist;
-                   if(current_ask <= tp1_price)
-                   {
-                      double min_lot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-                      double lot_step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-                      double close_vol = pos_vol / 2.0;
-                      if(lot_step > 0)
-                         close_vol = MathRound(close_vol / lot_step) * lot_step;
-                      if(close_vol < min_lot) close_vol = min_lot;
-                      
-                      if(close_vol < pos_vol)
-                      {
-                         if(trade.PositionClose(ticket, close_vol))
-                         {
-                            Print("[EuroQuant Multi-Bridge] TP1 Raggiunto su SELL ", symbol, ". Chiusura parziale di ", DoubleToString(close_vol, 2), " lotti.");
-                            double current_tp = PositionGetDouble(POSITION_TP);
-                            trade.PositionModify(ticket, pos_open, current_tp);
-                         }
-                      }
-                   }
-                }
-             }
-          }
-       }
-    }
-    
-    if(action == "CLOSE_ALL" || action == "HOLD" || action == "NEUTRAL" || action == "NONE")
-    {
-       return;
-    }
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber && PositionGetString(POSITION_SYMBOL) == symbol)
+      {
+         long pos_type = PositionGetInteger(POSITION_TYPE);
+         if(pos_type == POSITION_TYPE_BUY)
+         {
+            has_buy = true;
+            if(action == "SELL")
+            {
+               trade.PositionClose(ticket);
+               Print("[EuroQuant Multi-Bridge] Chiusa posizione BUY su ", symbol, " per segnale SELL.");
+               has_buy = false;
+            }
+         }
+         else if(pos_type == POSITION_TYPE_SELL)
+         {
+            has_sell = true;
+            if(action == "BUY")
+            {
+               trade.PositionClose(ticket);
+               Print("[EuroQuant Multi-Bridge] Chiusa posizione SELL su ", symbol, " per segnale BUY.");
+               has_sell = false;
+            }
+         }
+      }
+   }
    
    if(!InpEnableTrading)
    {
@@ -394,6 +341,16 @@ void ProcessSingleSignal(string json_obj)
       if((action == "BUY" && !has_buy) || (action == "SELL" && !has_sell))
       {
          Print("[EuroQuant Multi-Bridge] Limite massimo posizioni simultanee raggiunto (", InpMaxOpenPositions, "). Ordine per ", symbol, " ignorato.");
+         return;
+      }
+   }
+    
+   // Check Trading Hours Filter
+   if(!is_trading_hour)
+   {
+      if((action == "BUY" && !has_buy) || (action == "SELL" && !has_sell))
+      {
+         Print("[EuroQuant Multi-Bridge] Fuori orario di trading (H", dt.hour, "). Ordine per ", symbol, " ignorato.");
          return;
       }
    }
@@ -422,7 +379,7 @@ void ProcessSingleSignal(string json_obj)
       }
    }
    
-   // Calculate lot size dynamically based on selected sizing mode
+   // Calculate lot size dynamically for this specific symbol
    double min_lot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double max_lot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
    double lot_step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
@@ -432,53 +389,7 @@ void ProcessSingleSignal(string json_obj)
       return; // Skip if volume limits can't be fetched
    }
    
-   double trade_lot = min_lot;
-   
-   if(InpSizingMode == SIZING_MIN_LOT_MULTIPLIER)
-   {
-      trade_lot = min_lot * InpLotMultiplier * volatility_lot_sizing;
-   }
-   else if(InpSizingMode == SIZING_RISK_PERCENT)
-   {
-      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-      double risk_amount = balance * (InpRiskPercent / 100.0);
-      double sl_distance = MathAbs(entry_price - stop_loss);
-      
-      if(sl_distance > 0)
-      {
-         double tick_value = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
-         double tick_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
-         if(tick_size > 0 && tick_value > 0)
-         {
-            double sl_distance_ticks = sl_distance / tick_size;
-            trade_lot = (risk_amount / (sl_distance_ticks * tick_value)) * volatility_lot_sizing;
-         }
-      }
-      else
-      {
-         trade_lot = min_lot * InpLotMultiplier * volatility_lot_sizing;
-      }
-   }
-   else if(InpSizingMode == SIZING_MARGIN_PERCENT)
-   {
-      double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-      double target_margin = balance * (InpMarginPercent / 100.0);
-      double margin_one_lot = 0.0;
-      
-      ENUM_ORDER_TYPE order_type = (action == "BUY") ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-      double check_price = (action == "BUY") ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
-      
-      if(check_price > 0 && OrderCalcMargin(order_type, symbol, 1.0, check_price, margin_one_lot) && margin_one_lot > 0)
-      {
-         trade_lot = (target_margin / margin_one_lot) * volatility_lot_sizing;
-      }
-      else
-      {
-         trade_lot = min_lot * InpLotMultiplier * volatility_lot_sizing;
-      }
-   }
-   
-   // Normalize to broker volume step
+   double trade_lot = min_lot * InpLotMultiplier * volatility_lot_sizing;
    if(lot_step > 0)
    {
       trade_lot = MathRound(trade_lot / lot_step) * lot_step;
@@ -490,33 +401,79 @@ void ProcessSingleSignal(string json_obj)
    if(action == "BUY" && !has_buy)
    {
       double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-      if(ask <= 0) return;
+      double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+      if(ask <= 0 || bid <= 0) return;
       
-      // Safety SL/TP bounds checks
-      if(stop_loss >= ask) stop_loss = ask - 100 * point;
-      if(take_profit <= ask && take_profit > 0) take_profit = ask + 200 * point;
+      double stop_level = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+      double freeze_level = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL) * point;
+      double spread_dist = (ask - bid) * 1.5;
+      double min_dist = MathMax(stop_level, freeze_level);
+      if(min_dist == 0) min_dist = MathMax(10 * point, spread_dist);
       
-      trade.Buy(trade_lot, symbol, ask, stop_loss, take_profit, "EQ Multi-Symbol BUY");
-      Print("[EuroQuant Multi-Bridge] BUY ", symbol, " | Lotti: ", DoubleToString(trade_lot, 2));
-      if(InpSendAlerts)
+      double tick_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+      if(tick_size == 0) tick_size = point;
+      
+      // Safety SL/TP bounds checks & Normalization
+      // For BUY, close happens at BID. SL must be < BID, TP must be > BID.
+      if(stop_loss >= bid - min_dist && stop_loss > 0) stop_loss = bid - min_dist - 10 * point;
+      if(take_profit <= bid + min_dist && take_profit > 0) take_profit = bid + min_dist + 10 * point;
+      
+      stop_loss = MathRound(stop_loss / tick_size) * tick_size;
+      take_profit = MathRound(take_profit / tick_size) * tick_size;
+      stop_loss = NormalizeDouble(stop_loss, digits);
+      take_profit = NormalizeDouble(take_profit, digits);
+      
+      if(trade.Buy(trade_lot, symbol, ask, stop_loss, take_profit, "EQ Multi-Symbol BUY"))
       {
-         Alert("[EuroQuant Multi-Bridge] Nuova operazione BUY su ", symbol, " (Volume: ", DoubleToString(trade_lot, 2), ")");
+         Print("[EuroQuant Multi-Bridge] BUY ", symbol, " eseguito | Lotti: ", DoubleToString(trade_lot, 2));
+         LogExecution(symbol, "BUY", trade_lot, ask, entry_price);
+         if(InpSendAlerts)
+         {
+            Alert("[EuroQuant Multi-Bridge] Nuova operazione BUY su ", symbol, " (Volume: ", DoubleToString(trade_lot, 2), ")");
+         }
+      }
+      else
+      {
+         Print("[EuroQuant Multi-Bridge] Errore BUY ", symbol, " | Errore MT5: ", GetLastError());
       }
    }
    else if(action == "SELL" && !has_sell)
    {
       double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-      if(bid <= 0) return;
+      double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+      if(bid <= 0 || ask <= 0) return;
       
-      // Safety SL/TP bounds checks
-      if(stop_loss <= bid && stop_loss > 0) stop_loss = bid + 100 * point;
-      if(take_profit >= bid) take_profit = bid - 200 * point;
+      double stop_level = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+      double freeze_level = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL) * point;
+      double spread_dist = (ask - bid) * 1.5;
+      double min_dist = MathMax(stop_level, freeze_level);
+      if(min_dist == 0) min_dist = MathMax(10 * point, spread_dist);
       
-      trade.Sell(trade_lot, symbol, bid, stop_loss, take_profit, "EQ Multi-Symbol SELL");
-      Print("[EuroQuant Multi-Bridge] SELL ", symbol, " | Lotti: ", DoubleToString(trade_lot, 2));
-      if(InpSendAlerts)
+      double tick_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+      if(tick_size == 0) tick_size = point;
+      
+      // Safety SL/TP bounds checks & Normalization
+      // For SELL, close happens at ASK. SL must be > ASK, TP must be < ASK.
+      if(stop_loss <= ask + min_dist && stop_loss > 0) stop_loss = ask + min_dist + 10 * point;
+      if(take_profit >= ask - min_dist && take_profit > 0) take_profit = ask - min_dist - 10 * point;
+      
+      stop_loss = MathRound(stop_loss / tick_size) * tick_size;
+      take_profit = MathRound(take_profit / tick_size) * tick_size;
+      stop_loss = NormalizeDouble(stop_loss, digits);
+      take_profit = NormalizeDouble(take_profit, digits);
+      
+      if(trade.Sell(trade_lot, symbol, bid, stop_loss, take_profit, "EQ Multi-Symbol SELL"))
       {
-         Alert("[EuroQuant Multi-Bridge] Nuova operazione SELL su ", symbol, " (Volume: ", DoubleToString(trade_lot, 2), ")");
+         Print("[EuroQuant Multi-Bridge] SELL ", symbol, " eseguito | Lotti: ", DoubleToString(trade_lot, 2));
+         LogExecution(symbol, "SELL", trade_lot, bid, entry_price);
+         if(InpSendAlerts)
+         {
+            Alert("[EuroQuant Multi-Bridge] Nuova operazione SELL su ", symbol, " (Volume: ", DoubleToString(trade_lot, 2), ")");
+         }
+      }
+      else
+      {
+         Print("[EuroQuant Multi-Bridge] Errore SELL ", symbol, " | Errore MT5: ", GetLastError());
       }
    }
 }
@@ -588,10 +545,36 @@ int GetTotalOpenPositions()
 }
 
 //+------------------------------------------------------------------+
+//| Query global kill-switch status from the backend                |
+//+------------------------------------------------------------------+
+void CheckGlobalKillSwitch()
+{
+   if(safeguard_tripped) return;
+   
+   string url = "http://127.0.0.1:8000/api/mt5/risk";
+   char post[], result[];
+   string headers;
+   
+   int res = WebRequest("GET", url, headers, 1000, post, result, headers);
+   if(res == 200)
+   {
+      string response = CharArrayToString(result);
+      if(StringFind(response, "\"emergency_kill_switch\":true") >= 0 || StringFind(response, "\"emergency_kill_switch\": true") >= 0)
+      {
+         safeguard_tripped = true;
+         Print("[EuroQuant Safeguard] CRITICAL: GLOBAL KILL-SWITCH ATTIVATO DAL SERVER!");
+         CloseAllPositions();
+         Alert("[EuroQuant Safeguard] CRITICAL: Global Kill-Switch attivato! Trading sospeso.");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Safeguard verification logic                                     |
 //+------------------------------------------------------------------+
 void CheckSafeguards()
 {
+   CheckGlobalKillSwitch();
    if(safeguard_tripped) return;
    
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -647,6 +630,31 @@ void CloseAllPositions()
    }
 }
 
+//--- ATR Caching for Dynamic Trailing
+int atr_handles[];
+string atr_symbols[];
+
+int GetATRHandle(string symbol) {
+    int size = ArraySize(atr_symbols);
+    for(int i=0; i<size; i++) {
+        if(atr_symbols[i] == symbol) return atr_handles[i];
+    }
+    int handle = iATR(symbol, PERIOD_D1, 14);
+    ArrayResize(atr_symbols, size+1);
+    ArrayResize(atr_handles, size+1);
+    atr_symbols[size] = symbol;
+    atr_handles[size] = handle;
+    return handle;
+}
+
+double GetATR(string symbol) {
+    int handle = GetATRHandle(symbol);
+    if(handle == INVALID_HANDLE) return 0.0;
+    double atr[1];
+    if(CopyBuffer(handle, 0, 0, 1, atr) > 0) return atr[0];
+    return 0.0;
+}
+
 //+------------------------------------------------------------------+
 //| Apply Trailing Stop Loss to active positions                    |
 //+------------------------------------------------------------------+
@@ -664,23 +672,73 @@ void ApplyTrailingStop()
          double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
          int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
          
+         double dynamic_ts_distance = InpTrailingStopPoints * point;
+         double dynamic_ts_step = InpTrailingStepPoints * point;
+         double be_trigger_distance = InpTrailingStopPoints * point;
+         
+         // Usa ATR per il calcolo dinamico
+         double atr = GetATR(symbol);
+         if(atr > 0) {
+            dynamic_ts_distance = atr * 1.5; // 1.5x ATR giornaliero
+            dynamic_ts_step = atr * 0.2;     // 0.2x ATR
+            be_trigger_distance = atr * InpBreakEvenAtrMult; // Break-Even Trigger
+         } else if (pos_open > 1000) {
+            // Fallback per crypto/indici senza ATR pronto
+            dynamic_ts_distance = pos_open * 0.005; // 0.5%
+            dynamic_ts_step = pos_open * 0.001;     // 0.1%
+            be_trigger_distance = pos_open * (InpBreakEvenFallbackPct / 100.0);
+         }
+         
+         double stop_level = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+         double tick_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+         
          if(pos_type == POSITION_TYPE_BUY)
          {
             double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-            double stop_level = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+            double current_profit = bid - pos_open;
             
-            if(bid - pos_open > InpTrailingStopPoints * point)
+            // Logica Break-Even
+            if(InpUseBreakEven && pos_sl < pos_open && current_profit >= be_trigger_distance)
             {
-               double new_sl = bid - InpTrailingStopPoints * point;
-               double tick_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+               double be_level = pos_open + (tick_size > 0 ? tick_size * 2 : point * 10);
+               if(bid - be_level > stop_level)
+               {
+                  if(trade.PositionModify(ticket, be_level, PositionGetDouble(POSITION_TP)))
+                  {
+                     Print("[EuroQuant Break-Even] Assicurato pareggio su BUY ticket ", ticket, " a ", DoubleToString(be_level, digits));
+                     if(InpEnablePartialClose)
+                     {
+                        double vol = PositionGetDouble(POSITION_VOLUME);
+                        double min_lot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+                        double lot_step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+                        double half_vol = MathRound((vol / 2.0) / lot_step) * lot_step;
+                        if(half_vol >= min_lot)
+                        {
+                           trade.PositionClosePartial(ticket, half_vol);
+                           Print("[EuroQuant Scale-Out] Chiuso 50% (", DoubleToString(half_vol, 2), " lotti) su BUY ticket ", ticket);
+                        }
+                     }
+                  }
+                  else
+                     Print("[EuroQuant Break-Even] Errore su BUY ticket ", ticket, " - MT5: ", GetLastError());
+                  continue; // Skip trailing until next tick to give breathing room
+               }
+            }
+            
+            // Logica Trailing Stop
+            if(current_profit > dynamic_ts_distance)
+            {
+               double new_sl = bid - dynamic_ts_distance;
                if(tick_size > 0) new_sl = MathRound(new_sl / tick_size) * tick_size;
                
-               if(new_sl > pos_sl + InpTrailingStepPoints * point || pos_sl == 0)
+               if(new_sl > pos_sl + dynamic_ts_step || pos_sl == 0)
                {
                   if(bid - new_sl > stop_level)
                   {
-                     trade.PositionModify(ticket, new_sl, PositionGetDouble(POSITION_TP));
-                     Print("[EuroQuant Trailing] Modificato SL BUY per ticket ", ticket, " a ", DoubleToString(new_sl, digits));
+                     if(trade.PositionModify(ticket, new_sl, PositionGetDouble(POSITION_TP)))
+                        Print("[EuroQuant Trailing] Modificato SL BUY per ticket ", ticket, " a ", DoubleToString(new_sl, digits));
+                     else
+                        Print("[EuroQuant Trailing] Errore modifica SL BUY ticket ", ticket, " - MT5: ", GetLastError());
                   }
                }
             }
@@ -688,20 +746,50 @@ void ApplyTrailingStop()
          else if(pos_type == POSITION_TYPE_SELL)
          {
             double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-            double stop_level = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+            double current_profit = pos_open - ask;
             
-            if(pos_open - ask > InpTrailingStopPoints * point)
+            // Logica Break-Even
+            if(InpUseBreakEven && (pos_sl > pos_open || pos_sl == 0) && current_profit >= be_trigger_distance)
             {
-               double new_sl = ask + InpTrailingStopPoints * point;
-               double tick_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+               double be_level = pos_open - (tick_size > 0 ? tick_size * 2 : point * 10);
+               if(be_level - ask > stop_level)
+               {
+                  if(trade.PositionModify(ticket, be_level, PositionGetDouble(POSITION_TP)))
+                  {
+                     Print("[EuroQuant Break-Even] Assicurato pareggio su SELL ticket ", ticket, " a ", DoubleToString(be_level, digits));
+                     if(InpEnablePartialClose)
+                     {
+                        double vol = PositionGetDouble(POSITION_VOLUME);
+                        double min_lot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+                        double lot_step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+                        double half_vol = MathRound((vol / 2.0) / lot_step) * lot_step;
+                        if(half_vol >= min_lot)
+                        {
+                           trade.PositionClosePartial(ticket, half_vol);
+                           Print("[EuroQuant Scale-Out] Chiuso 50% (", DoubleToString(half_vol, 2), " lotti) su SELL ticket ", ticket);
+                        }
+                     }
+                  }
+                  else
+                     Print("[EuroQuant Break-Even] Errore su SELL ticket ", ticket, " - MT5: ", GetLastError());
+                  continue;
+               }
+            }
+            
+            // Logica Trailing Stop
+            if(current_profit > dynamic_ts_distance)
+            {
+               double new_sl = ask + dynamic_ts_distance;
                if(tick_size > 0) new_sl = MathRound(new_sl / tick_size) * tick_size;
                
-               if(new_sl < pos_sl - InpTrailingStepPoints * point || pos_sl == 0)
+               if(new_sl < pos_sl - dynamic_ts_step || pos_sl == 0)
                {
                   if(new_sl - ask > stop_level)
                   {
-                     trade.PositionModify(ticket, new_sl, PositionGetDouble(POSITION_TP));
-                     Print("[EuroQuant Trailing] Modificato SL SELL per ticket ", ticket, " a ", DoubleToString(new_sl, digits));
+                     if(trade.PositionModify(ticket, new_sl, PositionGetDouble(POSITION_TP)))
+                        Print("[EuroQuant Trailing] Modificato SL SELL per ticket ", ticket, " a ", DoubleToString(new_sl, digits));
+                     else
+                        Print("[EuroQuant Trailing] Errore modifica SL SELL ticket ", ticket, " - MT5: ", GetLastError());
                   }
                }
             }
@@ -736,33 +824,33 @@ void DrawDashboard()
       ObjectSetInteger(0, bg_name, OBJPROP_HIDDEN, true);
    }
    
-   DrawRow(prefix + "R1", "EUROQUANT PORTFOLIO-BRIDGE", x_start + 15, y_start + 10, C'255, 120, 0', 9, true);
+   DrawRow(prefix + "R1", "EUROQUANT INSTITUTIONAL PORTFOLIO", x_start + 15, y_start + 10, C'255, 120, 0', 9, true);
    
-   string status_str = "Status: ACTIVE (OK)";
+   string status_str = "System Status: ACTIVE (OK)";
    color status_col = C'0, 230, 118';
    if(safeguard_tripped)
    {
-      status_str = "Status: SAFEGUARD TRIPPED";
+      status_str = "System Status: SAFEGUARD TRIPPED";
       status_col = C'255, 23, 68';
    }
    DrawRow(prefix + "R2", status_str, x_start + 15, y_start + 30, status_col, 8, true);
    
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double pnl = equity - starting_equity;
-   string pnl_text = "PnL Giornaliero: " + DoubleToString(pnl, 2) + " " + AccountInfoString(ACCOUNT_CURRENCY);
+   string pnl_text = "Daily PnL: " + DoubleToString(pnl, 2) + " " + AccountInfoString(ACCOUNT_CURRENCY);
    color pnl_col = (pnl >= 0) ? C'0, 230, 118' : C'255, 23, 68';
    DrawRow(prefix + "R3", pnl_text, x_start + 15, y_start + 50, pnl_col, 8, false);
    
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double drawdown_pct = (balance > 0) ? ((balance - equity) / balance) * 100.0 : 0.0;
    if(drawdown_pct < 0) drawdown_pct = 0.0;
-   string dd_text = "Drawdown: " + DoubleToString(drawdown_pct, 2) + "% (Max: " + DoubleToString(InpMaxDrawdownPercent, 2) + "%)";
+   string dd_text = "Drawdown: " + DoubleToString(drawdown_pct, 2) + "% (Max Allowed: " + DoubleToString(InpMaxDrawdownPercent, 2) + "%)";
    DrawRow(prefix + "R4", dd_text, x_start + 15, y_start + 70, C'200, 200, 200', 8, false);
    
    int pos_count = GetTotalOpenPositions();
-   DrawRow(prefix + "R5", "Posizioni EA: " + IntegerToString(pos_count) + " / " + IntegerToString(InpMaxOpenPositions), x_start + 15, y_start + 90, C'200, 200, 200', 8, false);
-   DrawRow(prefix + "R6", "Magic: " + IntegerToString(InpMagicNumber) + " | Check: " + IntegerToString(InpCheckIntervalSecs) + "s", x_start + 15, y_start + 110, C'140, 150, 170', 7, false);
-   DrawRow(prefix + "R7", "Zulu Time: " + TimeToString(TimeGMT(), TIME_SECONDS) + " Z", x_start + 15, y_start + 130, C'110, 120, 140', 7, false);
+   DrawRow(prefix + "R5", "EA Open Positions: " + IntegerToString(pos_count) + " / " + IntegerToString(InpMaxOpenPositions), x_start + 15, y_start + 90, C'200, 200, 200', 8, false);
+   DrawRow(prefix + "R6", "Sync: " + IntegerToString(InpCheckIntervalSecs) + "s | Magic: " + IntegerToString(InpMagicNumber), x_start + 15, y_start + 110, C'140, 150, 170', 7, false);
+   DrawRow(prefix + "R7", "ZULU Time: " + TimeToString(TimeGMT(), TIME_SECONDS) + " Z", x_start + 15, y_start + 130, C'110, 120, 140', 7, false);
    
    ChartRedraw();
 }
@@ -802,5 +890,79 @@ void CleanupDashboard()
       }
    }
    ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Sync live positions to Docker backend                            |
+//+------------------------------------------------------------------+
+void SyncLivePositions()
+{
+   string url = "http://127.0.0.1:8000/api/mt5/positions";
+   string json = "{\"positions\":[";
+   
+   bool first = true;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetSymbol(i) != "")
+      {
+         if(!first) json += ",";
+         json += "{";
+         json += "\"ticker\":\"" + PositionGetString(POSITION_SYMBOL) + "\",";
+         json += "\"quantity\":" + DoubleToString(PositionGetDouble(POSITION_VOLUME), 2) + ",";
+         json += "\"avg_price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), 5) + ",";
+         json += "\"current_price\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_CURRENT), 5) + ",";
+         json += "\"unrealized_pnl\":" + DoubleToString(PositionGetDouble(POSITION_PROFIT), 2);
+         json += "}";
+         first = false;
+      }
+   }
+   json += "]}";
+   
+   char data[];
+   StringToCharArray(json, data, 0, WHOLE_ARRAY, CP_UTF8);
+   // Remove trailing null terminator from the char array
+   int size = ArraySize(data);
+   if(size > 0 && data[size-1] == 0) ArrayResize(data, size-1);
+   
+   char result[];
+   string result_headers;
+   string headers = "Content-Type: application/json\r\n";
+   
+   int res = WebRequest("POST", url, headers, 5000, data, result, result_headers);
+   if(res == -1) {
+      Print("[EuroQuant Sync] WebRequest POST failed! Error: ", GetLastError(), " URL: ", url);
+   } else if (res != 200) {
+      Print("[EuroQuant Sync] HTTP Error: ", res, " | Response: ", CharArrayToString(result));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Log order execution to Docker backend                            |
+//+------------------------------------------------------------------+
+void LogExecution(string ticker, string action, double volume, double fill_price, double requested_price)
+{
+   double slippage = 0.0;
+   if(action == "BUY") slippage = fill_price - requested_price;
+   else if(action == "SELL") slippage = requested_price - fill_price;
+   
+   string url = "http://127.0.0.1:8000/api/mt5/execution-log";
+   string json = "{";
+   json += "\"ticker\":\"" + ticker + "\",";
+   json += "\"action\":\"" + action + "\",";
+   json += "\"quantity\":" + DoubleToString(volume, 2) + ",";
+   json += "\"fill_price\":" + DoubleToString(fill_price, 5) + ",";
+   json += "\"slippage\":" + DoubleToString(slippage, 5);
+   json += "}";
+   
+   char data[];
+   StringToCharArray(json, data, 0, WHOLE_ARRAY, CP_UTF8);
+   int size = ArraySize(data);
+   if(size > 0 && data[size-1] == 0) ArrayResize(data, size-1);
+   
+   char result[];
+   string result_headers;
+   string headers = "Content-Type: application/json\r\n";
+   
+   WebRequest("POST", url, headers, 5000, data, result, result_headers);
 }
 //+------------------------------------------------------------------+

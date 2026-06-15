@@ -31,12 +31,15 @@ def seed_global_data():
             # South Korea
             ('005930.KS', 'Samsung Electronics Co., Ltd.', 'South Korea', 'Technology', 'Consumer Electronics', 0.90),
             # Crypto
-            ('BTC-USD', 'Bitcoin', 'Crypto', 'Crypto', 'Cryptocurrency', 0.95),
-            ('ETH-USD', 'Ethereum', 'Crypto', 'Crypto', 'Cryptocurrency', 0.90),
-            ('XRP-USD', 'Ripple', 'Crypto', 'Crypto', 'Cryptocurrency', 0.85),
-            ('SOL-USD', 'Solana', 'Crypto', 'Crypto', 'Cryptocurrency', 0.85),
-            ('ADA-USD', 'Cardano', 'Crypto', 'Crypto', 'Cryptocurrency', 0.80),
-            ('DOT-USD', 'Polkadot', 'Crypto', 'Crypto', 'Cryptocurrency', 0.80)
+            ('BTCUSD', 'Bitcoin', 'Crypto', 'Crypto', 'Cryptocurrency', 0.95),
+            ('ETHUSD', 'Ethereum', 'Crypto', 'Crypto', 'Cryptocurrency', 0.90),
+            ('XRPUSD', 'Ripple', 'Crypto', 'Crypto', 'Cryptocurrency', 0.85),
+            ('SOLUSD', 'Solana', 'Crypto', 'Crypto', 'Cryptocurrency', 0.85),
+            ('ADAUSD', 'Cardano', 'Crypto', 'Crypto', 'Cryptocurrency', 0.80),
+            ('DOTUSD', 'Polkadot', 'Crypto', 'Crypto', 'Cryptocurrency', 0.80),
+            # Precious Metals (Commodities)
+            ('GC=F', 'Gold Futures', 'Global', 'Commodity', 'Precious Metals', 0.95),
+            ('SI=F', 'Silver Futures', 'Global', 'Commodity', 'Precious Metals', 0.90)
         ]
         
         for ticker, name, country, sector, industry, trust in companies:

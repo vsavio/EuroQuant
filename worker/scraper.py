@@ -127,5 +127,71 @@ def scrape_feeds():
     finally:
         db.close()
 
+def scrape_reddit():
+    """
+    Scrapes alternative retail sentiment from Reddit (r/WallStreetBets, r/StockMarket).
+    """
+    db = SessionLocal()
+    headers = {"User-Agent": "EuroQuant Bot 1.0"}
+    subreddits = ["wallstreetbets", "StockMarket"]
+    new_articles = 0
+    
+    try:
+        for sub in subreddits:
+            url = f"https://www.reddit.com/r/{sub}/hot.json?limit=25"
+            print(f"Scraping Reddit: {sub}...")
+            try:
+                res = requests.get(url, headers=headers, timeout=10)
+                if res.status_code == 200:
+                    data = res.json()
+                    posts = data.get("data", {}).get("children", [])
+                    
+                    for post in posts:
+                        pdata = post.get("data", {})
+                        post_id = pdata.get("id")
+                        title = pdata.get("title", "")
+                        content = pdata.get("selftext", "")
+                        permalink = "https://www.reddit.com" + pdata.get("permalink", "")
+                        created_utc = pdata.get("created_utc")
+                        
+                        if not title or not created_utc:
+                            continue
+                            
+                        # Avoid duplicates
+                        exists = db.execute(
+                            text("SELECT 1 FROM news_articles WHERE url = :url LIMIT 1"),
+                            {"url": permalink}
+                        ).fetchone()
+                        
+                        if exists:
+                            continue
+                            
+                        pub_date = datetime.fromtimestamp(created_utc, timezone.utc)
+                        full_text = content if content else title
+                        
+                        db.execute(
+                            text("""
+                                INSERT INTO news_articles (title, content, url, source, published_date, country, processed)
+                                VALUES (:title, :content, :url, :source, :published_date, :country, FALSE)
+                            """),
+                            {
+                                "title": title[:255],
+                                "content": full_text,
+                                "url": permalink,
+                                "source": f"Reddit r/{sub}",
+                                "published_date": pub_date,
+                                "country": "Global"
+                            }
+                        )
+                        new_articles += 1
+                db.commit()
+            except Exception as e:
+                print(f"Reddit scrape failed for {sub}: {e}")
+                db.rollback()
+        print(f"Reddit scrape complete. Added {new_articles} retail posts.")
+    finally:
+        db.close()
+
 if __name__ == "__main__":
     scrape_feeds()
+    scrape_reddit()

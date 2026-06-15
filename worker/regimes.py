@@ -12,7 +12,7 @@ def classify_market_regimes():
     db = SessionLocal()
     try:
         # Fetch active tickers
-        tickers_rows = db.execute(text("SELECT ticker FROM companies")).fetchall()
+        tickers_rows = db.execute(text("SELECT ticker FROM companies WHERE is_active = TRUE")).fetchall()
         tickers = [r[0] for r in tickers_rows]
         
         print(f"Regime Switching: Evaluating {len(tickers)} companies...")
@@ -104,8 +104,29 @@ def classify_market_regimes():
                 "vol": current_vol,
                 "atr": current_atr_ratio
             })
-            db.commit()
+        # ─── Crash Protection (Global Circuit Breaker) ───────────────
+        panic_count = db.execute(text("SELECT COUNT(*) FROM market_regimes WHERE regime = 'REGIME_PANIC'")).scalar()
+        total_assets = len(tickers)
+        panic_ratio = panic_count / total_assets if total_assets > 0 else 0
+        
+        # Check V2TX directly
+        v2tx_row = db.execute(text("SELECT close FROM stock_prices WHERE ticker = '^V2TX' ORDER BY timestamp DESC LIMIT 1")).fetchone()
+        v2tx_val = float(v2tx_row[0]) if v2tx_row and v2tx_row[0] else 0.0
+        
+        # Check Gold momentum
+        gold_row = db.execute(text("SELECT close FROM stock_prices WHERE ticker = 'GC=F' ORDER BY timestamp DESC LIMIT 2")).fetchall()
+        gold_spike = False
+        if len(gold_row) == 2 and gold_row[0][0] and gold_row[1][0]:
+            gold_spike = (float(gold_row[0][0]) / float(gold_row[1][0]) - 1.0) > 0.02 # 2% daily spike in Gold
             
+        if panic_ratio >= 0.25 or v2tx_val > 30.0 or (panic_ratio >= 0.15 and gold_spike):
+            print(f"CRASH PROTECTION TRIGGERED: Panic Ratio={panic_ratio:.2f}, V2TX={v2tx_val:.2f}, GoldSpike={gold_spike}")
+            db.execute(text("UPDATE system_settings SET trading_halted = TRUE WHERE id = 1"))
+        else:
+            db.execute(text("UPDATE system_settings SET trading_halted = FALSE WHERE id = 1"))
+            
+        db.commit()
+        
         print("Regime Switching evaluation completed.")
     except Exception as e:
         print(f"Error classifying market regimes: {e}")
