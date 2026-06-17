@@ -128,7 +128,20 @@ def run_pipeline():
         classify_market_regimes()
     except Exception as e:
         print(f"Pipeline Error in Regime Classifier: {e}")
+    # 3c. Alternative Data Collection (Options, Dark Pools, Social)
+    try:
+        from alternative_data import run_alternative_data_collection
+        run_alternative_data_collection()
+    except Exception as e:
+        print(f"Pipeline Error in Alternative Data Engine: {e}")
         
+    # 3d. Graph Neural Network (GNN) Contagion
+    try:
+        from gnn_engine import run_gnn_contagion
+        run_gnn_contagion()
+    except Exception as e:
+        print(f"Pipeline Error in GNN Engine: {e}")
+
     # 4. Generate Recommendations (LLM)
     try:
         generate_recommendations()
@@ -249,7 +262,7 @@ def monitor_vix_and_hedge():
         db = SessionLocal()
         try:
             # Check if we already have an active hedge
-            active_hedge = db.execute(text("SELECT id FROM recommendations WHERE ticker = 'US500' AND action = 'SELL' AND status = 'pending'")).fetchone()
+            active_hedge = db.execute(text("SELECT ticker FROM recommendations WHERE ticker = 'US500' AND signal IN ('SELL', 'STRONG SELL')")).fetchone()
             if active_hedge:
                 return # Already hedging
                 
@@ -265,9 +278,14 @@ def monitor_vix_and_hedge():
                 
                 if vix_val > 30.0 and req_lots > 0:
                     db.execute(text("""
-                        INSERT INTO recommendations (ticker, action, quantity, price, reason, status)
-                        VALUES ('US500', 'SELL', :qty, 0.0, 'AUTO-HEDGE (VIX SPIKE)', 'pending')
-                    """), {"qty": req_lots})
+                        INSERT INTO recommendations (ticker, signal, reason_macro, timestamp, full_reason)
+                        VALUES ('US500', 'SELL', 'AUTO-HEDGE (VIX SPIKE)', NOW(), 'VIX ha superato la soglia critica. Hedge attivato.')
+                        ON CONFLICT (ticker) DO UPDATE SET 
+                            signal = EXCLUDED.signal, 
+                            reason_macro = EXCLUDED.reason_macro,
+                            full_reason = EXCLUDED.full_reason,
+                            timestamp = EXCLUDED.timestamp
+                    """))
                     db.commit()
                     print(f"🛡️ AUTO-HEDGE TRIGGERED: VIX at {vix_val:.2f}. Selling {req_lots} lots of US500")
         except Exception as e:
@@ -396,6 +414,45 @@ def main():
                 reason_technical TEXT
             )
         """))
+        
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS options_flow (
+                id SERIAL PRIMARY KEY,
+                ticker VARCHAR(20) NOT NULL,
+                timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                put_call_ratio NUMERIC(5, 4),
+                bullish_flow_pct NUMERIC(5, 4),
+                bearish_flow_pct NUMERIC(5, 4),
+                unusual_activity BOOLEAN DEFAULT FALSE,
+                UNIQUE(ticker, timestamp)
+            )
+        """))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS dark_pool_prints (
+                id SERIAL PRIMARY KEY,
+                ticker VARCHAR(20) NOT NULL,
+                timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                total_volume BIGINT,
+                institutional_buy_pct NUMERIC(5, 4),
+                UNIQUE(ticker, timestamp)
+            )
+        """))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS social_sentiment (
+                id SERIAL PRIMARY KEY,
+                ticker VARCHAR(20) NOT NULL,
+                timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                reddit_mentions INTEGER DEFAULT 0,
+                reddit_sentiment NUMERIC(5, 4) DEFAULT 0.0,
+                x_mentions INTEGER DEFAULT 0,
+                x_sentiment NUMERIC(5, 4) DEFAULT 0.0,
+                UNIQUE(ticker, timestamp)
+            )
+        """))
+        
+        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS put_call_ratio NUMERIC(5,4)"))
+        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS dark_pool_index NUMERIC(5,4)"))
+        db.execute(text("ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS gnn_contagio NUMERIC(5,4)"))
         
         db.execute(text("ALTER TABLE stock_prices ADD COLUMN IF NOT EXISTS adx NUMERIC(15,4)"))
         db.execute(text("ALTER TABLE stock_prices ADD COLUMN IF NOT EXISTS atr NUMERIC(15,4)"))

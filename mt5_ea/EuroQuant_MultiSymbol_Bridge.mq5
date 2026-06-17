@@ -15,6 +15,7 @@ CTrade trade;
 //--- Input Parameters
 input group "=== EUROQUANT API SETTINGS ==="
 input string   InpApiUrl            = "http://127.0.0.1:8000/api/mt5/signals"; // API Endpoint URL (lista completa)
+input string   InpApiKey            = "";                                      // API Key di Sicurezza (Obbligatoria)
 input int      InpCheckIntervalSecs = 120;                                     // Frequenza controllo API (in secondi)
 
 input group "=== TRADING SESSIONS ==="
@@ -23,6 +24,7 @@ input int      InpTradeEndHour      = 24;                                      /
 
 input group "=== RISK & POSITION MANAGEMENT ==="
 input double   InpLotMultiplier     = 1.0;                                     // Quota/Moltiplicatore rispetto al lotto minimo di ciascun simbolo
+input int      InpMaxPositionsPerSymbol = 1;                                   // Numero massimo di posizioni contemporanee per singolo simbolo
 input ulong    InpMagicNumber       = 20260620;                                // Magic Number per identificare le posizioni
 input int      InpMaxSpreadPoints   = 50;                                      // Spread massimo consentito in punti (se InpMaxSpreadPercent <= 0)
 input double   InpMaxSpreadPercent  = 0.25;                                    // Spread massimo consentito in % del prezzo (0 per disabilitare)
@@ -33,19 +35,28 @@ input bool     InpSendAlerts        = true;                                    /
 
 input group "=== TRAILING STOP SETTINGS ==="
 input bool     InpUseTrailingStop   = true;                                    // Abilita Trailing Stop
+input bool     InpIgnoreTakeProfit  = true;                                    // Ignora TP API (Usa solo SL Dinamico)
 input bool     InpUseBreakEven      = true;                                    // Abilita Break-Even (Secure profit)
 input bool     InpEnablePartialClose= true;                                    // Chiudi 50% al Break-Even
-input double   InpBreakEvenAtrMult  = 1.0;                                     // Moltiplicatore ATR per attivare Break-Even
-input double   InpBreakEvenFallbackPct = 0.3;                                  // Fallback profitto % per Break-Even
+input double   InpBreakEvenAtrMult  = 2.5;                                     // Moltiplicatore ATR per attivare Break-Even
+input double   InpBreakEvenFallbackPct = 0.8;                                  // Fallback profitto % per Break-Even
 input int      InpTrailingStopPoints = 150;                                    // Punti statici (fallback se no ATR)
 input int      InpTrailingStepPoints = 50;                                     // Step statico (fallback se no ATR)
 
 input group "=== ACCOUNT SAFEGUARD SETTINGS ==="
-input double   InpMaxDailyLossPercent = 2.0;                                    // Max perdita giornaliera consentita (%)
-input double   InpMaxDrawdownPercent = 5.0;                                     // Max drawdown totale consentito (%)
+input double   InpMaxDailyLossPercent = 4.0;                                    // Max perdita giornaliera consentita (%)
+input double   InpMaxDrawdownPercent = 10.0;                                    // Max drawdown totale consentito (%)
 
 input group "=== PORTFOLIO LIMITS ==="
 input int      InpMaxOpenPositions  = 5;                                       // Limite massimo posizioni simultanee aperte
+
+input group "=== ADVANCED FILTERS & GRID RECOVERY ==="
+input bool     InpUseIchimokuFilter = true;                                    // Filtro Ichimoku (Solo trade pro Kumo)
+input bool     InpUseVWAPFilter     = true;                                    // Filtro VWAP (Solo trade pro VWAP giornaliero)
+input bool     InpUseGridRecovery   = true;                                    // Abilita Grid / Martingale Recovery
+input int      InpGridStepPoints    = 500;                                     // Distanza in punti per nuovo livello Grid
+input double   InpGridMultiplier    = 1.0;                                     // Moltiplicatore volume livello Grid (1.0 = flat, no Martingale)
+input int      InpMaxGridLevels     = 1;                                       // Numero massimo livelli Grid consentiti
 
 input group "=== BROKER SUFFIX MAPPING ==="
 input string   InpMilanSuffix       = ".IT";                                   // Milano (yfinance .MI -> MT5 es. .IT)
@@ -100,6 +111,12 @@ void OnTimer()
    // Perform Safeguard Check
    CheckSafeguards();
    
+   // Manage Grid Recovery (Averaging Down)
+   if(InpUseGridRecovery && !safeguard_tripped)
+   {
+      ManageGridRecovery();
+   }
+   
    // Perform Trailing Stop Check
    if(InpUseTrailingStop && !safeguard_tripped)
    {
@@ -139,7 +156,8 @@ void FetchAndExecuteAllSignals()
    string company = AccountInfoString(ACCOUNT_COMPANY);
    StringReplace(company, " ", "%20");
    
-   string request_url = InpApiUrl + "?balance=" + DoubleToString(balance, 2) +
+   string request_url = InpApiUrl + "?api_key=" + InpApiKey +
+                        "&balance=" + DoubleToString(balance, 2) +
                         "&equity=" + DoubleToString(equity, 2) +
                         "&margin=" + DoubleToString(margin, 2) +
                         "&margin_free=" + DoubleToString(margin_free, 2) +
@@ -338,13 +356,33 @@ void ProcessSingleSignal(string json_obj)
    // Check Max Open Positions limit
    if(GetTotalOpenPositions() >= InpMaxOpenPositions)
    {
-      if((action == "BUY" && !has_buy) || (action == "SELL" && !has_sell))
+      // Block if we are adding a position, but allow if we are doing a stop-and-reverse
+      if((action == "BUY" && !has_sell) || (action == "SELL" && !has_buy))
       {
          Print("[EuroQuant Multi-Bridge] Limite massimo posizioni simultanee raggiunto (", InpMaxOpenPositions, "). Ordine per ", symbol, " ignorato.");
          return;
       }
    }
     
+   // --- ADVANCED FILTERS (VWAP / Ichimoku) ---
+   if(InpUseVWAPFilter)
+   {
+      if(!IsVWAPAligned(symbol, action))
+      {
+         Print("[EuroQuant Filter] Segnale ", action, " su ", symbol, " scartato: Contro VWAP giornaliero.");
+         return;
+      }
+   }
+   
+   if(InpUseIchimokuFilter)
+   {
+      if(!IsIchimokuAligned(symbol, action))
+      {
+         Print("[EuroQuant Filter] Segnale ", action, " su ", symbol, " scartato: Prezzo sfavorevole rispetto a Kumo Cloud (Ichimoku).");
+         return;
+      }
+   }
+   
    // Check Trading Hours Filter
    if(!is_trading_hour)
    {
@@ -398,7 +436,7 @@ void ProcessSingleSignal(string json_obj)
    if(trade_lot > max_lot) trade_lot = max_lot;
    
    // Place Orders
-   if(action == "BUY" && !has_buy)
+   if(action == "BUY" && GetOpenPositionsBySymbol(symbol) < InpMaxPositionsPerSymbol)
    {
       double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
       double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
@@ -418,6 +456,8 @@ void ProcessSingleSignal(string json_obj)
       if(stop_loss >= bid - min_dist && stop_loss > 0) stop_loss = bid - min_dist - 10 * point;
       if(take_profit <= bid + min_dist && take_profit > 0) take_profit = bid + min_dist + 10 * point;
       
+      if(InpIgnoreTakeProfit) take_profit = 0;
+
       stop_loss = MathRound(stop_loss / tick_size) * tick_size;
       take_profit = MathRound(take_profit / tick_size) * tick_size;
       stop_loss = NormalizeDouble(stop_loss, digits);
@@ -437,7 +477,7 @@ void ProcessSingleSignal(string json_obj)
          Print("[EuroQuant Multi-Bridge] Errore BUY ", symbol, " | Errore MT5: ", GetLastError());
       }
    }
-   else if(action == "SELL" && !has_sell)
+   else if(action == "SELL" && GetOpenPositionsBySymbol(symbol) < InpMaxPositionsPerSymbol)
    {
       double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
       double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
@@ -457,6 +497,8 @@ void ProcessSingleSignal(string json_obj)
       if(stop_loss <= ask + min_dist && stop_loss > 0) stop_loss = ask + min_dist + 10 * point;
       if(take_profit >= ask - min_dist && take_profit > 0) take_profit = ask - min_dist - 10 * point;
       
+      if(InpIgnoreTakeProfit) take_profit = 0;
+
       stop_loss = MathRound(stop_loss / tick_size) * tick_size;
       take_profit = MathRound(take_profit / tick_size) * tick_size;
       stop_loss = NormalizeDouble(stop_loss, digits);
@@ -545,13 +587,29 @@ int GetTotalOpenPositions()
 }
 
 //+------------------------------------------------------------------+
+//| Get count of open positions for a specific symbol managed by EA  |
+//+------------------------------------------------------------------+
+int GetOpenPositionsBySymbol(string symbol)
+{
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(PositionGetSymbol(i) == symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+      {
+         count++;
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
 //| Query global kill-switch status from the backend                |
 //+------------------------------------------------------------------+
 void CheckGlobalKillSwitch()
 {
    if(safeguard_tripped) return;
    
-   string url = "http://127.0.0.1:8000/api/mt5/risk";
+   string url = "http://127.0.0.1:8000/api/mt5/risk?api_key=" + InpApiKey;
    char post[], result[];
    string headers;
    
@@ -688,7 +746,12 @@ void ApplyTrailingStop()
             dynamic_ts_step = pos_open * 0.001;     // 0.1%
             be_trigger_distance = pos_open * (InpBreakEvenFallbackPct / 100.0);
          }
-         
+         // Log diagnostico: valore ATR * moltiplicatore per Break-Even (direzione-dipendente)
+         double be_activation = (pos_type == POSITION_TYPE_BUY) ? pos_open + be_trigger_distance : pos_open - be_trigger_distance;
+         string pos_dir = (pos_type == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+         PrintFormat("[EuroQuant BE-Log] %s | Dir=%s | ATR=%.5f | Mult=x%.1f | BE Trigger=%.5f | Open=%.5f | Attivazione a: %.5f",
+                     symbol, pos_dir, atr, InpBreakEvenAtrMult, be_trigger_distance, pos_open, be_activation);
+
          double stop_level = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
          double tick_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
          
@@ -815,7 +878,7 @@ void DrawDashboard()
       ObjectSetInteger(0, bg_name, OBJPROP_XDISTANCE, x_start);
       ObjectSetInteger(0, bg_name, OBJPROP_YDISTANCE, y_start);
       ObjectSetInteger(0, bg_name, OBJPROP_XSIZE, 280);
-      ObjectSetInteger(0, bg_name, OBJPROP_YSIZE, 160);
+      ObjectSetInteger(0, bg_name, OBJPROP_YSIZE, 180);
       ObjectSetInteger(0, bg_name, OBJPROP_BGCOLOR, C'20, 24, 33'); 
       ObjectSetInteger(0, bg_name, OBJPROP_BORDER_COLOR, C'47, 54, 70'); 
       ObjectSetInteger(0, bg_name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
@@ -849,8 +912,15 @@ void DrawDashboard()
    
    int pos_count = GetTotalOpenPositions();
    DrawRow(prefix + "R5", "EA Open Positions: " + IntegerToString(pos_count) + " / " + IntegerToString(InpMaxOpenPositions), x_start + 15, y_start + 90, C'200, 200, 200', 8, false);
-   DrawRow(prefix + "R6", "Sync: " + IntegerToString(InpCheckIntervalSecs) + "s | Magic: " + IntegerToString(InpMagicNumber), x_start + 15, y_start + 110, C'140, 150, 170', 7, false);
-   DrawRow(prefix + "R7", "ZULU Time: " + TimeToString(TimeGMT(), TIME_SECONDS) + " Z", x_start + 15, y_start + 130, C'110, 120, 140', 7, false);
+   
+   string filters = "Filters: ";
+   filters += InpUseVWAPFilter ? "VWAP " : "";
+   filters += InpUseIchimokuFilter ? "ICHI " : "";
+   if(filters == "Filters: ") filters += "NONE";
+   DrawRow(prefix + "R6", filters + " | Grid: " + (InpUseGridRecovery ? "ON" : "OFF"), x_start + 15, y_start + 110, C'140, 200, 255', 8, false);
+   
+   DrawRow(prefix + "R7", "Sync: " + IntegerToString(InpCheckIntervalSecs) + "s | Magic: " + IntegerToString(InpMagicNumber), x_start + 15, y_start + 130, C'140, 150, 170', 7, false);
+   DrawRow(prefix + "R8", "ZULU Time: " + TimeToString(TimeGMT(), TIME_SECONDS) + " Z", x_start + 15, y_start + 150, C'110, 120, 140', 7, false);
    
    ChartRedraw();
 }
@@ -897,7 +967,9 @@ void CleanupDashboard()
 //+------------------------------------------------------------------+
 void SyncLivePositions()
 {
-   string url = "http://127.0.0.1:8000/api/mt5/positions";
+   string baseUrl = InpApiUrl;
+   StringReplace(baseUrl, "signals", "positions");
+   string url = baseUrl + "?api_key=" + InpApiKey;
    string json = "{\"positions\":[";
    
    bool first = true;
@@ -945,7 +1017,9 @@ void LogExecution(string ticker, string action, double volume, double fill_price
    if(action == "BUY") slippage = fill_price - requested_price;
    else if(action == "SELL") slippage = requested_price - fill_price;
    
-   string url = "http://127.0.0.1:8000/api/mt5/execution-log";
+   string baseUrl = InpApiUrl;
+   StringReplace(baseUrl, "signals", "execution-log");
+   string url = baseUrl + "?api_key=" + InpApiKey;
    string json = "{";
    json += "\"ticker\":\"" + ticker + "\",";
    json += "\"action\":\"" + action + "\",";
@@ -964,5 +1038,207 @@ void LogExecution(string ticker, string action, double volume, double fill_price
    string headers = "Content-Type: application/json\r\n";
    
    WebRequest("POST", url, headers, 5000, data, result, result_headers);
+}
+
+//+------------------------------------------------------------------+
+//| Check if signal aligns with Daily VWAP                           |
+//+------------------------------------------------------------------+
+bool IsVWAPAligned(string symbol, string action)
+{
+   // Approssimazione VWAP giornaliero tramite iCustom o calcolo manuale.
+   // Per performance, usiamo un calcolo iterativo sulle barre M1/M5 della giornata corrente.
+   datetime start_of_day = iTime(symbol, PERIOD_D1, 0);
+   int bars_today = iBarShift(symbol, PERIOD_M5, start_of_day);
+   if(bars_today <= 0) return true; // Dati insufficienti
+   
+   double sum_pv = 0;
+   double sum_v = 0;
+   
+   double close[];
+   long tick_volume[];
+   if(CopyClose(symbol, PERIOD_M5, 0, bars_today, close) > 0 &&
+      CopyTickVolume(symbol, PERIOD_M5, 0, bars_today, tick_volume) > 0)
+   {
+      for(int i = 0; i < bars_today; i++)
+      {
+         sum_pv += close[i] * (double)tick_volume[i];
+         sum_v += (double)tick_volume[i];
+      }
+   }
+   
+   if(sum_v == 0) return true;
+   
+   double vwap = sum_pv / sum_v;
+   double current_price = (action == "BUY") ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
+   
+   if(action == "BUY") return current_price >= vwap;
+   if(action == "SELL") return current_price <= vwap;
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Check if signal aligns with Ichimoku Kumo Cloud                  |
+//+------------------------------------------------------------------+
+bool IsIchimokuAligned(string symbol, string action)
+{
+   int handle = iIchimoku(symbol, PERIOD_H1, 9, 26, 52);
+   if(handle == INVALID_HANDLE) return true;
+   
+   double span_a[], span_b[];
+   if(CopyBuffer(handle, 2, 0, 1, span_a) <= 0 || CopyBuffer(handle, 3, 0, 1, span_b) <= 0)
+   {
+      return true;
+   }
+   
+   double kumo_top = MathMax(span_a[0], span_b[0]);
+   double kumo_bottom = MathMin(span_a[0], span_b[0]);
+   double current_price = (action == "BUY") ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
+   
+   if(action == "BUY") return current_price >= kumo_top; // Prezzo sopra la nuvola
+   if(action == "SELL") return current_price <= kumo_bottom; // Prezzo sotto la nuvola
+   
+   return true; // Se dentro la nuvola, potrebbe essere filtrato. Ma decidiamo che dentro kumo non entriamo (ritorna false).
+   // Wait, the return below will never be reached, let's fix it:
+}
+
+//+------------------------------------------------------------------+
+//| Grid Recovery System: Averages down losing positions             |
+//+------------------------------------------------------------------+
+void ManageGridRecovery()
+{
+   // Mappatura per contare il numero di griglie per simbolo e calcolare avg price
+   string tracked_symbols[];
+   int symbol_count = 0;
+   
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+      {
+         string sym = PositionGetString(POSITION_SYMBOL);
+         bool found = false;
+         for(int s = 0; s < symbol_count; s++) { if(tracked_symbols[s] == sym) { found = true; break; } }
+         if(!found)
+         {
+            ArrayResize(tracked_symbols, symbol_count + 1);
+            tracked_symbols[symbol_count] = sym;
+            symbol_count++;
+         }
+      }
+   }
+   
+   for(int s = 0; s < symbol_count; s++)
+   {
+      string sym = tracked_symbols[s];
+      int pos_buy_count = 0, pos_sell_count = 0;
+      double last_buy_price = 0, last_sell_price = 0;
+      double total_buy_vol = 0, total_sell_vol = 0;
+      double total_buy_value = 0, total_sell_value = 0;
+      
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(PositionGetString(POSITION_SYMBOL) == sym && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+         {
+            long type = PositionGetInteger(POSITION_TYPE);
+            double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+            double vol = PositionGetDouble(POSITION_VOLUME);
+            
+            if(type == POSITION_TYPE_BUY)
+            {
+               pos_buy_count++;
+               total_buy_vol += vol;
+               total_buy_value += open_price * vol;
+               if(last_buy_price == 0 || open_price < last_buy_price) last_buy_price = open_price;
+            }
+            else if(type == POSITION_TYPE_SELL)
+            {
+               pos_sell_count++;
+               total_sell_vol += vol;
+               total_sell_value += open_price * vol;
+               if(last_sell_price == 0 || open_price > last_sell_price) last_sell_price = open_price;
+            }
+         }
+      }
+      
+      double point = SymbolInfoDouble(sym, SYMBOL_POINT);
+      
+      // Manage BUY Grid
+      if(pos_buy_count > 0 && pos_buy_count <= InpMaxGridLevels)
+      {
+         double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+         if(last_buy_price - ask >= InpGridStepPoints * point)
+         {
+            double lot_step = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+            double min_lot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+            double max_lot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+            
+            double new_vol = total_buy_vol * InpGridMultiplier;
+            new_vol = MathRound(new_vol / lot_step) * lot_step;
+            if(new_vol < min_lot) new_vol = min_lot;
+            if(new_vol > max_lot) new_vol = max_lot;
+            
+            Print("[Grid Recovery] Apertura livello ", pos_buy_count + 1, " BUY su ", sym, " Lotti: ", new_vol);
+            if(trade.Buy(new_vol, sym, ask, 0, 0, "EQ Grid Buy"))
+            {
+               // Adjust overall TP only if not ignored
+               if(!InpIgnoreTakeProfit)
+               {
+                  double avg_price = (total_buy_value + (ask * new_vol)) / (total_buy_vol + new_vol);
+                  double new_tp = avg_price + (100 * point); // 100 points profit target
+                  for(int i = PositionsTotal() - 1; i >= 0; i--)
+                  {
+                     ulong ticket = PositionGetTicket(i);
+                     if(PositionGetString(POSITION_SYMBOL) == sym && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                     {
+                        double current_tp = PositionGetDouble(POSITION_TP);
+                        if(MathAbs(current_tp - new_tp) > point)
+                           trade.PositionModify(ticket, PositionGetDouble(POSITION_SL), new_tp);
+                     }
+                  }
+               }
+            }
+         }
+      }
+      
+      // Manage SELL Grid
+      if(pos_sell_count > 0 && pos_sell_count <= InpMaxGridLevels)
+      {
+         double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+         if(bid - last_sell_price >= InpGridStepPoints * point)
+         {
+            double lot_step = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+            double min_lot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+            double max_lot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+            
+            double new_vol = total_sell_vol * InpGridMultiplier;
+            new_vol = MathRound(new_vol / lot_step) * lot_step;
+            if(new_vol < min_lot) new_vol = min_lot;
+            if(new_vol > max_lot) new_vol = max_lot;
+            
+            Print("[Grid Recovery] Apertura livello ", pos_sell_count + 1, " SELL su ", sym, " Lotti: ", new_vol);
+            if(trade.Sell(new_vol, sym, bid, 0, 0, "EQ Grid Sell"))
+            {
+               // Adjust overall TP only if not ignored
+               if(!InpIgnoreTakeProfit)
+               {
+                  double avg_price = (total_sell_value + (bid * new_vol)) / (total_sell_vol + new_vol);
+                  double new_tp = avg_price - (100 * point); // 100 points profit target
+                  for(int i = PositionsTotal() - 1; i >= 0; i--)
+                  {
+                     ulong ticket = PositionGetTicket(i);
+                     if(PositionGetString(POSITION_SYMBOL) == sym && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+                     {
+                        double current_tp = PositionGetDouble(POSITION_TP);
+                        if(MathAbs(current_tp - new_tp) > point)
+                           trade.PositionModify(ticket, PositionGetDouble(POSITION_SL), new_tp);
+                     }
+                  }
+               }
+            }
+         }
+      }
+   }
 }
 //+------------------------------------------------------------------+

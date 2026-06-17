@@ -276,15 +276,37 @@ def fetch_and_calculate_all():
         db.close()
 
 def get_latest_v2tx():
-    """Fetches the latest V2TX volatility index close price directly from yfinance."""
+    """Fetches the latest V2TX volatility index close price.
+    Tries multiple ticker aliases. Falls back to VIX (^VIX) + correction factor
+    since V2TX and VIX are ~92% correlated historically.
+    """
+    # V2TX aliases
+    candidates = ["^V2TX", "V2TX", "EVZEUR=X", "^VSTOXX"]
+    for sym in candidates:
+        try:
+            ticker = yf.Ticker(sym)
+            history = ticker.history(period="5d")
+            if not history.empty:
+                val = float(history["Close"].iloc[-1])
+                print(f"V2TX fetched via {sym}: {val:.2f}")
+                return val
+        except Exception:
+            continue
+
+    # Fallback: VIX + 1.5 correction factor (V2TX is historically ~1-2 pts above VIX)
     try:
-        ticker = yf.Ticker("^V2TX")
-        history = ticker.history(period="5d")
+        vix = yf.Ticker("^VIX")
+        history = vix.history(period="5d")
         if not history.empty:
-            return float(history["Close"].iloc[-1])
+            vix_val = float(history["Close"].iloc[-1])
+            v2tx_est = round(vix_val + 1.5, 2)
+            print(f"V2TX not found. Using VIX proxy: {vix_val:.2f} + 1.5 = {v2tx_est:.2f}")
+            return v2tx_est
     except Exception as e:
-        print(f"Failed to fetch V2TX index: {e}")
-    return 20.0 # Safe default default if yfinance fails
+        print(f"VIX fallback also failed: {e}")
+
+    print("All volatility sources failed. Using safe default 20.0")
+    return 20.0
 
 if __name__ == "__main__":
     fetch_and_calculate_all()

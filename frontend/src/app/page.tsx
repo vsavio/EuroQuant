@@ -5,7 +5,7 @@ import {
   TrendingUp, TrendingDown, RefreshCw, AlertTriangle, 
   Search, ShieldAlert, Award, FileText, Globe, Cpu, X,
   Activity, ArrowUpRight, Newspaper, Play, Calendar, Percent,
-  PieChart, Crosshair
+  PieChart, Crosshair, Lock
 } from "lucide-react";
 import { 
   AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, 
@@ -107,6 +107,7 @@ interface StockDetail {
   ml_prediction_prob?: number;
   kelly_factor?: number;
   chandelier_exit_distance?: number;
+  full_reason?: string;
 }
 
 interface BrokerAccount {
@@ -294,7 +295,7 @@ export default function TerminalDashboard() {
   const [riskModalValue, setRiskModalValue] = useState("5.0");
 
   // Advanced components states
-  const [mainTab, setMainTab] = useState<"dashboard" | "risk_telemetry" | "correlation" | "backtest" | "audit_log" | "ai_ml" | "system_logs" | "portfolio_weights" | "hedging" | "live_trading" | "asset_config">("dashboard");
+  const [mainTab, setMainTab] = useState<"dashboard" | "risk_telemetry" | "correlation" | "backtest" | "audit_log" | "ai_ml" | "system_logs" | "portfolio_weights" | "hedging" | "live_trading" | "asset_config" | "api_keys">("dashboard");
   const [correlationData, setCorrelationData] = useState<{ tickers: string[]; matrix: number[][] } | null>(null);
   const [riskAnalytics, setRiskAnalytics] = useState<{ value_at_risk_95: number; sharpe_ratio: number; sortino_ratio: number; max_drawdown: number; equity_curve: any[] } | null>(null);
   const [stressTest, setStressTest] = useState<{ scenarios: { name: string; max_drawdown: number }[] } | null>(null);
@@ -318,11 +319,20 @@ export default function TerminalDashboard() {
   const [executionLogs, setExecutionLogs] = useState<any[]>([]);
   const [tickersConfig, setTickersConfig] = useState<any[]>([]);
   const [newTicker, setNewTicker] = useState({ ticker: "", name: "", country: "USA", sector: "Equities", industry: "" });
+  const [apiKeys, setApiKeys] = useState<any[]>([]);
+  const [apiKeysLoading, setApiKeysLoading] = useState(false);
+  const [showKeyModal, setShowKeyModal] = useState(false);
+  const [newKeyLabel, setNewKeyLabel] = useState("");
+  const [newKeyHourlyLimit, setNewKeyHourlyLimit] = useState(0);
+  const [newKeyDailyLimit, setNewKeyDailyLimit] = useState(0);
+  const [keyStats, setKeyStats] = useState<any>(null);
+  const [showStatsModal, setShowStatsModal] = useState<string | null>(null);
 
   // MVO, WFO, and Monte Carlo States
   const [monteCarloResults, setMonteCarloResults] = useState<any | null>(null);
   const [monteCarloLoading, setMonteCarloLoading] = useState(false);
   const [portfolioWeights, setPortfolioWeights] = useState<Record<string, number> | null>(null);
+  const [portfolioMetrics, setPortfolioMetrics] = useState<{ expected_return: number, expected_volatility: number, sharpe_ratio: number } | null>(null);
   const [portfolioWeightsLoading, setPortfolioWeightsLoading] = useState(false);
   const [economicCalendar, setEconomicCalendar] = useState<any[]>([]);
   const [marketRegimes, setMarketRegimes] = useState<any[]>([]);
@@ -503,13 +513,13 @@ export default function TerminalDashboard() {
     try {
       const token = localStorage.getItem("euroquant_token");
       if (token) {
-        const resPos = await fetch("http://localhost:8000/api/live-positions", {
+        const resPos = await fetch(`${API_URL}/api/live-positions`, {
           headers: { Authorization: `Bearer ${token}` }
         });
         const posData = await resPos.json();
         setLivePositions(posData.positions || []);
         
-        const resLogs = await fetch("http://localhost:8000/api/execution-logs", {
+        const resLogs = await fetch(`${API_URL}/api/execution-logs`, {
           headers: { Authorization: `Bearer ${token}` }
         });
         const logData = await resLogs.json();
@@ -525,14 +535,44 @@ export default function TerminalDashboard() {
       fetchLiveTrading();
     } else if (mainTab === "asset_config") {
       fetchTickersConfig();
+    } else if (mainTab === "api_keys") {
+      fetchApiKeys();
     }
   }, [mainTab]);
+
+  const fetchApiKeys = async () => {
+    setApiKeysLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/api/keys`);
+      if (res.ok) {
+        const data = await res.json();
+        setApiKeys(data.keys || []);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setApiKeysLoading(false);
+    }
+  };
+
+  const fetchKeyStats = async (key_value: string) => {
+    try {
+      const res = await fetch(`${API_URL}/api/keys/${key_value}/stats`);
+      if (res.ok) {
+        const data = await res.json();
+        setKeyStats(data);
+        setShowStatsModal(key_value);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
 
   const fetchTickersConfig = async () => {
     try {
       const token = localStorage.getItem("euroquant_token");
       if (token) {
-        const res = await fetch("http://localhost:8000/api/tickers", {
+        const res = await fetch(`${API_URL}/api/tickers`, {
           headers: { Authorization: `Bearer ${token}` }
         });
         const data = await res.json();
@@ -547,7 +587,7 @@ export default function TerminalDashboard() {
     try {
       const token = localStorage.getItem("euroquant_token");
       if (token) {
-        await fetch("http://localhost:8000/api/tickers/toggle", {
+        await fetch(`${API_URL}/api/tickers/toggle`, {
           method: "POST",
           headers: { 
             "Content-Type": "application/json",
@@ -567,7 +607,7 @@ export default function TerminalDashboard() {
     try {
       const token = localStorage.getItem("euroquant_token");
       if (token) {
-        const res = await fetch("http://localhost:8000/api/tickers/add", {
+        const res = await fetch(`${API_URL}/api/tickers/add`, {
           method: "POST",
           headers: { 
             "Content-Type": "application/json",
@@ -592,7 +632,7 @@ export default function TerminalDashboard() {
     try {
       const token = localStorage.getItem("euroquant_token");
       if (token) {
-        const res = await fetch("http://localhost:8000/api/hedging-strategies", {
+        const res = await fetch(`${API_URL}/api/hedging-strategies`, {
           headers: { Authorization: `Bearer ${token}` }
         });
         const data = await res.json();
@@ -607,7 +647,7 @@ export default function TerminalDashboard() {
     try {
       const token = localStorage.getItem("euroquant_token");
       if (token) {
-        const res = await fetch("http://localhost:8000/api/portfolio-weights", {
+        const res = await fetch(`${API_URL}/api/portfolio-weights`, {
           headers: { Authorization: `Bearer ${token}` }
         });
         const data = await res.json();
@@ -782,7 +822,8 @@ export default function TerminalDashboard() {
           const data = await res.json();
           setStockDetail(data);
           // Set default tab based on signal or macro risk
-          if (data.reason_micro) setActiveTab("micro");
+          if (data.full_reason) setActiveTab("reasoning");
+          else if (data.reason_micro) setActiveTab("micro");
           else if (data.reason_macro) setActiveTab("macro");
         }
       } catch (error) {
@@ -1386,6 +1427,16 @@ export default function TerminalDashboard() {
           }`}
         >
           <Search className="inline h-3 w-3 mr-1" /> Asset Config
+        </button>
+        <button
+          onClick={() => setMainTab("api_keys")}
+          className={`flex-1 py-1.5 text-xs font-black uppercase rounded tracking-wider transition flex items-center justify-center gap-1 ${
+            mainTab === "api_keys"
+              ? "bg-rose-500 text-white font-extrabold shadow-[0_0_8px_rgba(244,63,94,0.5)]"
+              : "text-slate-400 hover:text-white hover:bg-terminal-bg/50"
+          }`}
+        >
+          <Lock className="inline h-3 w-3" /> API Keys
         </button>
       </div>
 
@@ -2466,6 +2517,11 @@ export default function TerminalDashboard() {
                       if (res.ok) {
                         const data = await res.json();
                         setPortfolioWeights(data.weights);
+                        setPortfolioMetrics({
+                          expected_return: data.expected_return,
+                          expected_volatility: data.expected_volatility,
+                          sharpe_ratio: data.sharpe_ratio
+                        });
                       } else {
                         const err = await res.json();
                         alert(`Errore: ${err.detail || "Impossibile ottimizzare i pesi"}`);
@@ -2481,6 +2537,28 @@ export default function TerminalDashboard() {
                 >
                   {portfolioWeightsLoading ? "CALCOLO IN CORSO..." : "CALCOLA PESI OTTIMALI"}
                 </button>
+                {portfolioMetrics && portfolioWeights && (
+                  <div className="mt-3 bg-terminal-bg/50 border border-terminal-border/80 p-2 rounded flex justify-between items-center text-[10px] font-mono">
+                    <div className="flex flex-col items-center flex-1 border-r border-terminal-border/30">
+                      <span className="text-slate-500 font-bold uppercase text-[9px]">Rendimento Atteso</span>
+                      <span className={`font-black text-xs ${portfolioMetrics.expected_return >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                        {(portfolioMetrics.expected_return * 100).toFixed(2)}%
+                      </span>
+                    </div>
+                    <div className="flex flex-col items-center flex-1 border-r border-terminal-border/30">
+                      <span className="text-slate-500 font-bold uppercase text-[9px]">Volatilità (Rischio)</span>
+                      <span className="font-black text-xs text-amber-400">
+                        {(portfolioMetrics.expected_volatility * 100).toFixed(2)}%
+                      </span>
+                    </div>
+                    <div className="flex flex-col items-center flex-1">
+                      <span className="text-slate-500 font-bold uppercase text-[9px]">Indice di Sharpe</span>
+                      <span className={`font-black text-xs ${portfolioMetrics.sharpe_ratio >= 1.0 ? "text-terminal-accent" : "text-slate-300"}`}>
+                        {portfolioMetrics.sharpe_ratio.toFixed(2)}
+                      </span>
+                    </div>
+                  </div>
+                )}
                 
                 {portfolioWeights && (
                   <div className="mt-2 border border-terminal-border bg-terminal-bg/30 p-2 rounded max-h-[120px] overflow-y-auto">
@@ -3485,7 +3563,7 @@ export default function TerminalDashboard() {
                       <span className="text-[9px] text-slate-400 block mb-1">Snippet MQL5 (da copiare nel tuo EA):</span>
                       <pre className="p-2 bg-black border border-terminal-border rounded text-[9px] font-mono text-slate-300 overflow-x-auto max-h-28 whitespace-pre leading-normal">
 {`// Integrazione Segnale EuroQuant
-string url = "http://localhost:8000/api/mt5/signals?ticker=${stockDetail.ticker}";
+string url = "${API_URL}/api/mt5/signals?ticker=${stockDetail.ticker}";
 char post[], result[];
 string headers;
 ResetLastError();
@@ -3731,10 +3809,30 @@ if (res > 0) {
                     >
                       Storico Segnali
                     </button>
+                    {stockDetail.full_reason && (
+                      <button 
+                        onClick={() => setActiveTab("reasoning")}
+                        className={`py-2 px-3 whitespace-nowrap ${
+                          activeTab === "reasoning" 
+                            ? "text-terminal-accent border-b-2 border-terminal-accent" 
+                            : "text-slate-500 hover:text-slate-300"
+                        }`}
+                      >
+                        🤖 AI Reasoning
+                      </button>
+                    )}
                   </div>
 
                   {/* Tab Contents */}
                   <div className="flex-1 text-xs leading-relaxed text-slate-300 overflow-y-auto pr-1">
+                    {activeTab === "reasoning" && stockDetail.full_reason && (
+                      <div className="space-y-3">
+                        <div className="text-[11px] text-terminal-accent uppercase font-bold">Meta-Model Chain of Thought</div>
+                        <p className="bg-terminal-bg/40 p-3 rounded border border-terminal-border/40 whitespace-pre-line text-[11px] text-slate-200">
+                          {stockDetail.full_reason}
+                        </p>
+                      </div>
+                    )}
                     {activeTab === "micro" && (
                       <div className="space-y-3">
                         <div className="text-[11px] text-terminal-accent uppercase font-bold">Analisi Societaria e Sentiment News</div>
@@ -3928,6 +4026,219 @@ if (res > 0) {
                   )}
                 </tbody>
               </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* API Keys Management */}
+      {mainTab === "api_keys" && (
+        <div className="flex-1 overflow-auto p-4 space-y-4 fade-in">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-xl font-black uppercase tracking-widest text-rose-400 flex items-center gap-2">
+              <span className="text-2xl">🔐</span> Gestione MT5 API Keys
+            </h2>
+            <button 
+              onClick={() => setShowKeyModal(true)}
+              className="bg-rose-500/20 text-rose-400 border border-rose-500/50 hover:bg-rose-500 hover:text-white px-3 py-1.5 rounded font-bold text-[10px] uppercase transition"
+            >
+              + Genera Nuova Chiave
+            </button>
+          </div>
+
+          <div className="bg-terminal-bg border border-terminal-border rounded">
+            {apiKeysLoading ? (
+              <div className="text-center p-8 text-terminal-muted">Caricamento chiavi in corso...</div>
+            ) : apiKeys.length === 0 ? (
+              <div className="text-center p-8 text-terminal-muted">Nessuna API Key presente. L'EA MetaTrader è isolato.</div>
+            ) : (
+              <table className="w-full text-xs font-mono text-left">
+                <thead className="bg-terminal-bg border-b border-terminal-border/40 text-slate-400">
+                  <tr>
+                    <th className="py-2 px-3 font-bold">Label</th>
+                    <th className="py-2 px-3 font-bold">API Key (Token)</th>
+                    <th className="py-2 px-3 font-bold">Stato</th>
+                    <th className="py-2 px-3 font-bold">Limiti (1H / 24H)</th>
+                    <th className="py-2 px-3 font-bold">Data Creazione</th>
+                    <th className="py-2 px-3 font-bold text-right">Azioni</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-terminal-border/20 text-slate-300">
+                  {apiKeys.map(key => (
+                    <tr key={key.key_id} className="hover:bg-terminal-bg/50">
+                      <td className="py-2 px-3 font-bold text-white">{key.label}</td>
+                      <td className="py-2 px-3 text-terminal-accent">{key.key_value.substring(0, 8)}...{key.key_value.substring(key.key_value.length - 4)}</td>
+                      <td className="py-2 px-3">
+                        {key.is_active ? (
+                          <span className="text-emerald-400 bg-emerald-400/10 px-2 py-0.5 rounded font-black text-[9px] uppercase">Attiva</span>
+                        ) : (
+                          <span className="text-rose-400 bg-rose-400/10 px-2 py-0.5 rounded font-black text-[9px] uppercase">Revocata</span>
+                        )}
+                      </td>
+                      <td className="py-2 px-3 text-slate-400 font-mono text-[10px]">
+                        <span className="text-amber-400">{key.hourly_limit > 0 ? key.hourly_limit : "∞"}</span> / <span className="text-cyan-400">{key.daily_limit > 0 ? key.daily_limit : "∞"}</span>
+                      </td>
+                      <td className="py-2 px-3 text-slate-500">{new Date(key.created_at).toLocaleString()}</td>
+                      <td className="py-2 px-3 text-right">
+                        <button 
+                          onClick={() => fetchKeyStats(key.key_value)}
+                          className="px-2 py-1 rounded text-[10px] font-bold mr-2 bg-blue-500/20 text-blue-400 hover:bg-blue-500 hover:text-white transition"
+                        >
+                          Statistiche
+                        </button>
+                        <button 
+                          onClick={async () => {
+                            if(!confirm(`Sei sicuro di voler ${key.is_active ? 'DISABILITARE' : 'RIABILITARE'} questa chiave?`)) return;
+                            await fetch(`${API_URL}/api/keys/${key.key_value}/toggle`, { method: 'PUT' });
+                            fetchApiKeys();
+                          }}
+                          className={`px-2 py-1 rounded text-[10px] font-bold mr-2 ${key.is_active ? 'bg-amber-500/20 text-amber-500 hover:bg-amber-500 hover:text-black' : 'bg-emerald-500/20 text-emerald-500 hover:bg-emerald-500 hover:text-black'}`}
+                        >
+                          {key.is_active ? 'Disabilita' : 'Riabilita'}
+                        </button>
+                        <button 
+                          onClick={async () => {
+                            if(!confirm("ELIMINAZIONE DEFINITIVA. Continuare?")) return;
+                            await fetch(`${API_URL}/api/keys/${key.key_value}`, { method: 'DELETE' });
+                            fetchApiKeys();
+                          }}
+                          className="bg-rose-500/20 text-rose-500 hover:bg-rose-500 hover:text-white px-2 py-1 rounded text-[10px] font-bold"
+                        >
+                          Elimina
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Create Key Modal */}
+      {showKeyModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="bg-terminal-bg border border-terminal-border rounded-lg max-w-md w-full p-6 space-y-4">
+            <h3 className="text-lg font-black uppercase tracking-wider text-rose-400">Genera Nuova API Key</h3>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-bold text-slate-400 mb-1">Nome/Etichetta (es. VPS Londra 1)</label>
+                <input 
+                  type="text" 
+                  value={newKeyLabel} 
+                  onChange={e => setNewKeyLabel(e.target.value)}
+                  className="w-full bg-black/50 border border-terminal-border rounded p-2 text-sm text-white"
+                  placeholder="Nome univoco per questo client"
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-bold text-slate-400 mb-1">Limite Orario</label>
+                  <input 
+                    type="number" 
+                    value={newKeyHourlyLimit} 
+                    onChange={e => setNewKeyHourlyLimit(Number(e.target.value))}
+                    className="w-full bg-black/50 border border-terminal-border rounded p-2 text-sm text-amber-400 font-mono"
+                    min="0"
+                  />
+                  <div className="text-[9px] text-slate-500 mt-1">0 = illimitato</div>
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-400 mb-1">Limite Giornaliero (24H)</label>
+                  <input 
+                    type="number" 
+                    value={newKeyDailyLimit} 
+                    onChange={e => setNewKeyDailyLimit(Number(e.target.value))}
+                    className="w-full bg-black/50 border border-terminal-border rounded p-2 text-sm text-cyan-400 font-mono"
+                    min="0"
+                  />
+                  <div className="text-[9px] text-slate-500 mt-1">0 = illimitato</div>
+                </div>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-4">
+              <button onClick={() => setShowKeyModal(false)} className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-white">Annulla</button>
+              <button 
+                onClick={async () => {
+                  if(!newKeyLabel) return;
+                  try {
+                    const res = await fetch(`${API_URL}/api/keys`, {
+                      method: 'POST',
+                      headers: {'Content-Type': 'application/json'},
+                      body: JSON.stringify({ label: newKeyLabel, hourly_limit: newKeyHourlyLimit, daily_limit: newKeyDailyLimit })
+                    });
+                    if (res.ok) {
+                      const data = await res.json();
+                      prompt("Nuova chiave generata! Copiala da qui (Ctrl+C). Non verrà più mostrata interamente:", data.key);
+                      fetchApiKeys();
+                      setShowKeyModal(false);
+                      setNewKeyLabel("");
+                      setNewKeyHourlyLimit(0);
+                      setNewKeyDailyLimit(0);
+                    }
+                  } catch (e) { console.error(e); }
+                }}
+                className="bg-rose-500 text-white px-4 py-2 rounded text-xs font-bold hover:bg-rose-600 transition"
+              >
+                Genera Chiave
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Stats Modal */}
+      {showStatsModal && keyStats && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="bg-terminal-bg border border-terminal-border rounded-lg max-w-lg w-full p-6 space-y-6">
+            <div className="flex justify-between items-center border-b border-terminal-border pb-3">
+              <h3 className="text-lg font-black uppercase tracking-wider text-blue-400">Statistiche di Utilizzo</h3>
+              <button onClick={() => setShowStatsModal(null)} className="text-slate-500 hover:text-white text-xl">&times;</button>
+            </div>
+            
+            <div className="grid grid-cols-3 gap-4">
+              <div className="bg-black/40 p-4 rounded border border-terminal-border/50 text-center">
+                <div className="text-xs text-slate-500 uppercase font-bold">Ultima Ora</div>
+                <div className="text-2xl font-black text-amber-400 font-mono mt-1">{keyStats.last_hour}</div>
+              </div>
+              <div className="bg-black/40 p-4 rounded border border-terminal-border/50 text-center">
+                <div className="text-xs text-slate-500 uppercase font-bold">Ultime 24 Ore</div>
+                <div className="text-2xl font-black text-cyan-400 font-mono mt-1">{keyStats.last_day}</div>
+              </div>
+              <div className="bg-black/40 p-4 rounded border border-terminal-border/50 text-center">
+                <div className="text-xs text-slate-500 uppercase font-bold">Totale Assoluto</div>
+                <div className="text-2xl font-black text-white font-mono mt-1">{keyStats.total_usage}</div>
+              </div>
+            </div>
+
+            <div>
+              <h4 className="text-xs font-bold text-slate-400 uppercase mb-3">Storico Ultimi 7 Giorni</h4>
+              {keyStats.daily_breakdown && keyStats.daily_breakdown.length > 0 ? (
+                <div className="space-y-2">
+                  {keyStats.daily_breakdown.map((b: any, idx: number) => {
+                    const maxCount = Math.max(...keyStats.daily_breakdown.map((d: any) => d.count), 1);
+                    const pct = (b.count / maxCount) * 100;
+                    return (
+                      <div key={idx} className="flex items-center gap-3">
+                        <div className="w-20 text-xs font-mono text-slate-500">{b.date}</div>
+                        <div className="flex-1 h-4 bg-black/50 rounded overflow-hidden flex items-center">
+                          <div className="h-full bg-blue-500/50" style={{ width: `${pct}%` }}></div>
+                        </div>
+                        <div className="w-12 text-right text-xs font-bold text-blue-400">{b.count}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="text-center p-4 text-xs text-slate-500 italic">Nessun dato registrato negli ultimi 7 giorni.</div>
+              )}
+            </div>
+            
+            <div className="flex justify-end pt-2">
+              <button onClick={() => setShowStatsModal(null)} className="bg-terminal-border hover:bg-slate-700 text-white px-6 py-2 rounded text-xs font-bold transition">
+                Chiudi
+              </button>
             </div>
           </div>
         </div>

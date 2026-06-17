@@ -22,7 +22,7 @@ DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://euroquant_user:euroquant_password@db:5432/euroquant_db"
 )
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_size=20, max_overflow=20)
 
 # ─── WebSocket Manager ────────────────────────────────────────────────────────
 class ConnectionManager:

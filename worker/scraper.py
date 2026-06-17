@@ -11,9 +11,17 @@ def clean_html(html_content):
     if not html_content:
         return ""
     soup = BeautifulSoup(html_content, "html.parser")
-    # Remove script and style elements
-    for script in soup(["script", "style", "meta", "noscript", "header", "footer"]):
-        script.extract()
+    # Remove semantic trash and noisy elements
+    for element in soup(["script", "style", "meta", "noscript", "header", "footer", "nav", "aside", "form"]):
+        element.extract()
+        
+    # Remove common trash classes/ids
+    import re
+    trash_patterns = re.compile(r'cookie|banner|ad-|advert|social|share|popup|newsletter|subscribe', re.I)
+    for element in soup.find_all(attrs={"class": trash_patterns}):
+        element.extract()
+    for element in soup.find_all(attrs={"id": trash_patterns}):
+        element.extract()
     # Get text
     text_content = soup.get_text(separator=" ")
     # Break into lines and remove leading and trailing space on each

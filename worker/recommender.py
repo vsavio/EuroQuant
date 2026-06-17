@@ -8,8 +8,18 @@ from database import SessionLocal
 from config import OLLAMA_HOST, V2TX_THRESHOLD, USE_DEEP_LEARNING, USE_REINFORCEMENT_LEARNING
 from nlp import calculate_decayed_sentiment
 from ml_engine import train_and_predict_direction
-from dl_engine import train_and_predict_dl
-from rl_engine import train_rl_agent
+from external_ratings import fetch_external_ratings
+
+# Optional experimental engines
+try:
+    from dl_engine import train_and_predict_dl
+except ImportError:
+    train_and_predict_dl = None
+
+try:
+    from rl_engine import train_rl_agent
+except ImportError:
+    train_rl_agent = None
 
 # Structured JSON logger
 logging.basicConfig(
@@ -142,7 +152,7 @@ def get_top_news_for_company(ticker, db, limit=3):
         } for r in rows
     ]
 
-def query_gemini_recommendation(ticker, company_name, metrics, sentiment, news, v2tx, prompt):
+def query_gemini_recommendation(ticker, company_name, metrics, sentiment, news, v2tx, ml_prob, rl_action, prompt):
     """
     Queries Google Gemini API as a high-reliability fallback if local Ollama fails.
     """
@@ -172,19 +182,21 @@ def query_gemini_recommendation(ticker, company_name, metrics, sentiment, news, 
                 rating = "HOLD"
                 
             return {
+                "step_by_step_reasoning": data.get("step_by_step_reasoning", ""),
                 "rating": rating,
                 "reason_macro": data.get("reason_macro", ""),
                 "reason_micro": data.get("reason_micro", ""),
                 "reason_technical": data.get("reason_technical", "")
             }
+        else:
+            print(f"Gemini API fallback failed for {ticker}: HTTP {response.status_code} - {response.text}")
     except Exception as e:
         print(f"Gemini API fallback failed for {ticker}: {e}")
-    return None
-
-def query_ollama_recommendation(ticker, company_name, metrics, sentiment, news, v2tx):
+def query_llm_recommendation(ticker, company_name, metrics, sentiment, news, v2tx, ml_prob, rl_action, alt_data=None, ext_ratings=None):
     """
-    Constructs prompt and queries Ollama for financial rating and reasons.
-    If Ollama fails, routes request to the Gemini API adapter.
+    Constructs prompt and queries LLM for financial rating and reasons.
+    Primary: Google Gemini API
+    Fallback: Local Ollama
     """
     news_str = "\n".join([f"- [{n['source']}] {n['title']} (Sentiment: {n['sentiment']} / Score: {n['score']})" for n in news])
     
@@ -211,39 +223,70 @@ def query_ollama_recommendation(ticker, company_name, metrics, sentiment, news, 
     price_change = metrics.get("price_change_24h")
     price_change_str = f"{price_change:.2f}" if price_change is not None else "N/A"
     
+    v2tx_str = f"{v2tx:.2f}"
+    
+    alt_data_str = ""
+    if alt_data:
+        pcr = alt_data.get('put_call_ratio', 'N/A')
+        dpi = alt_data.get('dark_pool_index', 'N/A')
+        gnn = alt_data.get('gnn_contagio', 'N/A')
+        alt_data_str = f"""- Alternative Data (Microstructure & Graph AI):
+  * Options Put/Call Ratio: {pcr} (Higher = Bearish/Hedging)
+  * Dark Pool Index (DPI): {dpi} (Higher = Institutional Accumulation)
+  * Sector GNN Contagion Score: {gnn} (Positive = Sector Rally, Negative = Sector Crash)"""
+
+    ext_ratings_str = ""
+    if ext_ratings:
+        ext_ratings_str = f"""- External Institutional Ratings:
+  * Wall Street Consensus (Yahoo Finance): {ext_ratings.get('yfinance_analysts', 'N/A')}
+  * Technical Consensus (TradingView): {ext_ratings.get('tradingview', 'N/A')}"""
+
     prompt = f"""You are a senior institutional quantitative & financial analyst.
 Analyze the following asset data and news:
  
 Asset: {company_name} ({ticker})
 - Current Price: € {metrics.get('close')} (24h Change: {price_change_str}%)
+{ext_ratings_str}
 - Technical Indicators:
   * RSI (14): {rsi_str} (State: {rsi_state})
   * ADX (14) Trend Strength: {adx_str} {adx_desc}
   * MACD: {macd_str} (Signal Line: {macd_signal_str})
-  * SMA 20: € {metrics.get('sma_20')}
   * SMA 50: € {metrics.get('sma_50')}
   * SMA 200: € {metrics.get('sma_200')}
-  * VWAP (20-Day): € {f"{metrics.get('vwap_20d'):.2f}" if metrics.get('vwap_20d') else "N/A"}
 - Aggregated Sentiment (24h-48h Decayed): {sentiment:.4f}
-- VSTOXX Volatility Index (V2TX): {v2tx:.2f}
-- Recent News Context:
-{news_str if news_str else "No recent news found."}
+- Machine Learning Predictive Probability (Long): {ml_prob * 100:.2f}%
+- VSTOXX Volatility Index (V2TX): {v2tx_str}
+{alt_data_str}
 
-Provide an investment rating and professional analysis.
-The rating must be one of: STRONG BUY, BUY, HOLD, SELL, STRONG SELL.
+Provide a FINAL investment rating: STRONG BUY, BUY, HOLD, SELL, STRONG SELL.
+ACT AS AN ARBITER: Strongly consider the External Institutional Ratings (Yahoo/TradingView). Use the other data to confirm or deny their consensus. Keep your reasoning EXTREMELY brief.
+
+MANDATORY ML VETO RULES (you MUST follow these, they override everything else):
+- If ML Probability (Long) < 35%: rating CANNOT be STRONG BUY. Maximum allowed: BUY.
+- If ML Probability (Long) < 20%: rating CANNOT be BUY or STRONG BUY. Maximum allowed: HOLD.
+- If ML Probability (Long) > 65%: rating CANNOT be STRONG SELL. Minimum allowed: SELL.
+- If ML Probability (Long) > 80%: rating CANNOT be SELL or STRONG SELL. Minimum allowed: HOLD.
+- If ML Probability (Long) is between 40% and 60%: prefer HOLD unless external ratings strongly agree on BUY or SELL.
 
 You MUST respond ONLY with a valid JSON object in Italian matching this schema:
 {{
-  "rating": "STRONG BUY" | "BUY" | "HOLD" | "SELL" | "STRONG SELL",
-  "reason_macro": "Un paragrafo professionale in italiano che descrive il contesto macroeconomico e l'indice di riferimento.",
-  "reason_micro": "Un paragrafo professionale in italiano che descrive i dati aziendali, il sentiment delle notizie e l'andamento specifico.",
-  "reason_technical": "Un paragrafo professionale in italiano che descrive i trend tecnici, livelli di RSI, ADX, MACD e medie mobili."
+  "step_by_step_reasoning": "Massimo 2 frasi. Conferma o smentisci il consensus esterno basandoti su metriche interne (ML, Dark Pool).",
+  "rating": "STRONG BUY/BUY/HOLD/SELL/STRONG SELL",
+  "reason_macro": "Sintesi macro",
+  "reason_micro": "Sintesi micro/news",
+  "reason_technical": "Sintesi tecnica"
 }}
 
 Do not write any text outside of the JSON block. Do not include markdown code ticks.
 """
 
-    # 1. Try Ollama (Local) — only if health-check passed
+    # 1. Try Gemini API First
+    gemini_res = query_gemini_recommendation(ticker, company_name, metrics, sentiment, news, v2tx, ml_prob, rl_action, prompt)
+    if gemini_res:
+        print(f"Gemini API successful for {ticker}.")
+        return gemini_res
+
+    # 2. Fallback to Ollama (Local) — only if health-check passed
     if _ollama_available:
         try:
             url = f"{OLLAMA_HOST}/api/generate"
@@ -254,11 +297,11 @@ Do not write any text outside of the JSON block. Do not include markdown code ti
                 "format": "json",
                 "options": {
                     "num_thread": 4,
-                    "num_predict": 250
+                    "num_predict": 600
                 }
             }
             
-            response = requests.post(url, json=payload, timeout=30)
+            response = requests.post(url, json=payload, timeout=600)
             if response.status_code == 200:
                 res_data = response.json()
                 raw_text = res_data.get("response", "").strip()
@@ -268,20 +311,16 @@ Do not write any text outside of the JSON block. Do not include markdown code ti
                 if rating not in ["STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL"]:
                     rating = "HOLD"
                     
+                print(f"Ollama local fallback successful for {ticker}.")
                 return {
+                    "step_by_step_reasoning": data.get("step_by_step_reasoning", ""),
                     "rating": rating,
                     "reason_macro": data.get("reason_macro", ""),
                     "reason_micro": data.get("reason_micro", ""),
                     "reason_technical": data.get("reason_technical", "")
                 }
         except Exception as e:
-            print(f"Ollama recommendation failed for {ticker}: {e}. Trying Gemini API fallback...")
-        
-    # 2. Fallback to Gemini API
-    gemini_res = query_gemini_recommendation(ticker, company_name, metrics, sentiment, news, v2tx, prompt)
-    if gemini_res:
-        print(f"Gemini API fallback successful for {ticker}.")
-        return gemini_res
+            print(f"Ollama recommendation failed for {ticker}: {e}.")
         
     # 3. Final Rule-based Fallback
     print(f"All LLM backends failed for {ticker}. Running rule-based logic.")
@@ -337,12 +376,67 @@ def _process_single_company(comp, v2tx, db_url):
         # 3. Fetch recent news
         news = get_top_news_for_company(ticker, db)
 
-        # 4. Generate LLM recommendation (with Gemini fallback + rule-based)
-        log.info(json.dumps({"ticker": ticker, "event": "llm_start"}))
-        rec_data = query_ollama_recommendation(ticker, name, metrics, sentiment_score, news, v2tx)
+        # 4. Generate Machine Learning Predictions BEFORE LLM
+        rl_action = "N/A"
+        try:
+            ml_prob = train_and_predict_direction(ticker, db)
+            
+            if USE_DEEP_LEARNING and train_and_predict_dl is not None:
+                dl_prob = train_and_predict_dl(ticker, db)
+                ml_prob = (ml_prob + dl_prob) / 2.0  # Ensemble blending
+                log.info(json.dumps({"ticker": ticker, "event": "ml_ensemble_computed", "gb_prob": round(ml_prob*2-dl_prob, 4), "lstm_prob": round(dl_prob, 4), "final_prob": round(ml_prob, 4)}))
+            else:
+                log.info(json.dumps({"ticker": ticker, "event": "ml_prob_computed", "prob": round(ml_prob, 4)}))
+                
+            if USE_REINFORCEMENT_LEARNING and train_rl_agent is not None:
+                try:
+                    rl_action = train_rl_agent(ticker, db)
+                    log.info(json.dumps({"ticker": ticker, "event": "rl_computed", "action": rl_action}))
+                except Exception as rl_err:
+                    log.warning(json.dumps({"ticker": ticker, "event": "rl_failed", "error": str(rl_err)}))
+        except Exception as ml_err:
+            log.warning(json.dumps({"ticker": ticker, "event": "ml_failed", "error": str(ml_err)}))
+            ml_prob = 0.50
 
-        # 5. Risk Management: V2TX check
+        # 4.5 Fetch Alternative Data (if available)
+        alt_data = {}
+        try:
+            opt = db.execute(text("SELECT put_call_ratio FROM options_flow WHERE ticker = :t ORDER BY timestamp DESC LIMIT 1"), {"t": ticker}).fetchone()
+            if opt: alt_data['put_call_ratio'] = float(opt[0])
+            
+            dp = db.execute(text("SELECT institutional_buy_pct FROM dark_pool_prints WHERE ticker = :t ORDER BY timestamp DESC LIMIT 1"), {"t": ticker}).fetchone()
+            if dp: alt_data['dark_pool_index'] = float(dp[0])
+            
+            gn = db.execute(text("SELECT gnn_contagio FROM recommendations WHERE ticker = :t"), {"t": ticker}).fetchone()
+            if gn and gn[0] is not None: alt_data['gnn_contagio'] = float(gn[0])
+        except Exception:
+            pass
+
+        # 4.6 Fetch External Ratings
+        ext_ratings = fetch_external_ratings(ticker)
+        log.info(json.dumps({"ticker": ticker, "event": "ext_ratings_fetched", "ratings": ext_ratings}))
+
+        # 5. Generate LLM recommendation (with Gemini fallback + rule-based)
+        log.info(json.dumps({"ticker": ticker, "event": "llm_start"}))
+        rec_data = query_llm_recommendation(ticker, name, metrics, sentiment_score, news, v2tx, ml_prob, rl_action, alt_data, ext_ratings)
+
+        # 6. ML Veto — Hard-coded validation (overrides LLM if needed)
         final_rating = rec_data["rating"]
+        original_rating = final_rating
+        if ml_prob < 0.20 and final_rating in ["STRONG BUY", "BUY"]:
+            final_rating = "HOLD"
+            log.warning(json.dumps({"ticker": ticker, "event": "ml_veto", "from": original_rating, "to": final_rating, "ml_prob": ml_prob, "rule": "ml_prob<20%"}))
+        elif ml_prob < 0.35 and final_rating == "STRONG BUY":
+            final_rating = "BUY"
+            log.warning(json.dumps({"ticker": ticker, "event": "ml_veto", "from": original_rating, "to": final_rating, "ml_prob": ml_prob, "rule": "ml_prob<35%"}))
+        elif ml_prob > 0.80 and final_rating in ["STRONG SELL", "SELL"]:
+            final_rating = "HOLD"
+            log.warning(json.dumps({"ticker": ticker, "event": "ml_veto", "from": original_rating, "to": final_rating, "ml_prob": ml_prob, "rule": "ml_prob>80%"}))
+        elif ml_prob > 0.65 and final_rating == "STRONG SELL":
+            final_rating = "SELL"
+            log.warning(json.dumps({"ticker": ticker, "event": "ml_veto", "from": original_rating, "to": final_rating, "ml_prob": ml_prob, "rule": "ml_prob>65%"}))
+
+        # 7. Risk Management: V2TX check
         macro_reason = rec_data["reason_macro"]
 
         if v2tx > V2TX_THRESHOLD:
@@ -353,38 +447,17 @@ def _process_single_company(comp, v2tx, db_url):
             macro_reason = risk_msg + macro_reason
 
         full_reason = f"Macro:\n{macro_reason}\n\nMicro:\n{rec_data['reason_micro']}\n\nTechnical:\n{rec_data['reason_technical']}"
+        
+        # Inserisci il CoT (Chain of Thought) reasoning se disponibile
+        if rec_data.get("step_by_step_reasoning"):
+            full_reason = f"AI Reasoning:\n{rec_data['step_by_step_reasoning']}\n\n" + full_reason
 
-        # 6. Read previous signal for alert comparison
+        # 7. Read previous signal for alert comparison
         prev_row = db.execute(
             text("SELECT signal FROM recommendations WHERE ticker = :ticker"),
             {"ticker": ticker}
         ).fetchone()
         prev_signal = prev_row[0] if prev_row else None
-
-        # 6c. Reinforcement Learning (if enabled)
-        rl_action = "N/A"
-        
-        # 7. Train ML model
-        try:
-            ml_prob = train_and_predict_direction(ticker, db)
-            
-            # 6b. PyTorch Deep Learning LSTM Pipeline (if enabled)
-            if USE_DEEP_LEARNING:
-                dl_prob = train_and_predict_dl(ticker, db)
-                ml_prob = (ml_prob + dl_prob) / 2.0  # Ensemble blending
-                log.info(json.dumps({"ticker": ticker, "event": "ml_ensemble_computed", "gb_prob": round(ml_prob*2-dl_prob, 4), "lstm_prob": round(dl_prob, 4), "final_prob": round(ml_prob, 4)}))
-            else:
-                log.info(json.dumps({"ticker": ticker, "event": "ml_prob_computed", "prob": round(ml_prob, 4)}))
-                
-            if USE_REINFORCEMENT_LEARNING:
-                try:
-                    rl_action = train_rl_agent(ticker, db)
-                    log.info(json.dumps({"ticker": ticker, "event": "rl_computed", "action": rl_action}))
-                except Exception as rl_err:
-                    log.warning(json.dumps({"ticker": ticker, "event": "rl_failed", "error": str(rl_err)}))
-        except Exception as ml_err:
-            log.warning(json.dumps({"ticker": ticker, "event": "ml_failed", "error": str(ml_err)}))
-            ml_prob = 0.50
             
         if USE_REINFORCEMENT_LEARNING and rl_action != "N/A":
             full_reason += f"\n\nRL Agent (DQN): {rl_action}"
@@ -498,8 +571,8 @@ def generate_recommendations():
     log.info(json.dumps({"event": "engine_start", "v2tx": round(v2tx, 2), "companies": len(companies)}))
 
     updated_count = 0
-    # Parallelize LLM calls — max 4 concurrent to avoid overwhelming Ollama/Gemini
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # Parallelize LLM calls — max 2 concurrent to avoid overwhelming Ollama
+    with ThreadPoolExecutor(max_workers=1) as executor:
         futures = {
             executor.submit(_process_single_company, comp, v2tx, None): comp[0]
             for comp in companies

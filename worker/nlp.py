@@ -98,8 +98,8 @@ def analyze_sentiment_ollama(title, content):
 Analyze the following financial news title:
 "{title}"
 
-Respond ONLY with a valid JSON object in this exact format:
-{{"label": "positive" | "negative" | "neutral", "score": float}}
+Respond ONLY with a valid JSON object in this exact format, providing brief reasoning first:
+{{"reasoning": "string", "label": "positive" | "negative" | "neutral", "score": float}}
 Note: The score must be between -1.0 (extremely negative) and 1.0 (extremely positive). Do not output any markdown formatting, code block decorators, or explanations outside the JSON object.
 """
     try:
@@ -111,7 +111,7 @@ Note: The score must be between -1.0 (extremely negative) and 1.0 (extremely pos
             "format": "json",
             "options": {
                 "temperature": 0.0,
-                "num_predict": 35,  # Fix: Limit tokens generated to prevent trailing CPU load
+                "num_predict": 150,  # Increased for CoT reasoning
                 "num_thread": 4     # Fix: Limit CPU threads to reduce context switching overhead
             }
         }

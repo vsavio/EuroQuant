@@ -19,5 +19,5 @@ COPY . .
 # Expose port 8000
 EXPOSE 8000
 
-# Run FastAPI app using uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run FastAPI app using uvicorn with 4 workers to handle high-frequency MT5 requests
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]

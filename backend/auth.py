@@ -21,7 +21,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 8  # 8 hours
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://euroquant_user:euroquant_password@db:5432/euroquant_db")
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_size=20, max_overflow=20)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)
 router = APIRouter(prefix="/api/auth", tags=["auth"])

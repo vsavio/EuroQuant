@@ -33,7 +33,7 @@ def download_ticker_history(ticker: str, start: str = None, end: str = None) -> 
     Downloads historical price data trying professional feeds first,
     falling back to Yahoo Finance if they fail or are unconfigured.
     """
-    feeds = [ProfessionalFeed(), YFinanceFeed()]
+    feeds = [YFinanceFeed()]
     for feed in feeds:
         try:
             df = feed.download_history(ticker, start, end)

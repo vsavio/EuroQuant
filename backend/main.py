@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, WebSocket, WebSocketDisconnect, Depends
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, WebSocket, WebSocketDisconnect, Depends, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -87,6 +87,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+
 @app.websocket("/ws/telemetry")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
@@ -110,119 +111,17 @@ app.add_middleware(
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://euroquant_user:euroquant_password@db:5432/euroquant_db")
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_size=20, max_overflow=20)
+
 
 # Initialize table(s) if not exists
-try:
-    with engine.connect() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS system_settings (
-                id INTEGER PRIMARY KEY DEFAULT 1,
-                telegram_bot_token VARCHAR(255) DEFAULT '',
-                telegram_chat_id VARCHAR(50) DEFAULT '',
-                discord_webhook_url TEXT DEFAULT '',
-                CONSTRAINT single_row CHECK (id = 1)
-            )
-        """))
-        conn.execute(text("""
-            INSERT INTO system_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS broker_accounts (
-                account_id VARCHAR(50) PRIMARY KEY,
-                broker VARCHAR(100),
-                balance NUMERIC(15, 2),
-                equity NUMERIC(15, 2),
-                margin NUMERIC(15, 2),
-                margin_free NUMERIC(15, 2),
-                margin_level NUMERIC(15, 2),
-                profit NUMERIC(15, 2),
-                last_seen TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                max_drawdown_percent NUMERIC(5, 2) DEFAULT 5.0
-            )
-        """))
-        conn.execute(text("""
-            ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS max_drawdown_percent NUMERIC(5, 2) DEFAULT 5.0;
-        """))
-        conn.execute(text("""
-            ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS parent_article_id INTEGER;
-        """))
-        conn.execute(text("""
-            ALTER TABLE recommendations ADD COLUMN IF NOT EXISTS ml_prediction_prob NUMERIC(5, 4) DEFAULT 0.50;
-        """))
-        
-        # Create users table
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username VARCHAR(100) UNIQUE NOT NULL,
-                hashed_password VARCHAR(255) NOT NULL,
-                role VARCHAR(20) DEFAULT 'Trader',
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-        
-        # Seed default admin user (admin / admin123) if no users exist
-        user_count = conn.execute(text("SELECT COUNT(*) FROM users")).scalar()
-        if user_count == 0:
-            from auth import get_password_hash
-            admin_hash = get_password_hash("admin123")
-            conn.execute(
-                text("INSERT INTO users (username, hashed_password, role) VALUES ('admin', :hash, 'Admin')"),
-                {"hash": admin_hash}
-            )
-            
-        # Create orders table
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS orders (
-                id VARCHAR(50) PRIMARY KEY,
-                account_id VARCHAR(50) NOT NULL,
-                ticker VARCHAR(20) NOT NULL,
-                action VARCHAR(10) NOT NULL,
-                status VARCHAR(20) NOT NULL,
-                requested_price NUMERIC(15, 4),
-                executed_price NUMERIC(15, 4),
-                slippage NUMERIC(15, 4) DEFAULT 0.0,
-                commission NUMERIC(15, 4) DEFAULT 0.0,
-                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            )
-        """))
-        
-        # Create ml_model_metrics table
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS ml_model_metrics (
-                ticker VARCHAR(20) PRIMARY KEY,
-                last_trained TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                accuracy NUMERIC(5, 4),
-                precision NUMERIC(5, 4),
-                recall NUMERIC(5, 4),
-                f1_score NUMERIC(5, 4),
-                total_samples INTEGER,
-                features_used JSONB DEFAULT '[]'
-            )
-        """))
-        
-        # Removed native partitioning logic since TimescaleDB hypertables handle this automatically
-        
-        # Performance indexes — safe to run multiple times (IF NOT EXISTS)
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_stock_prices_ticker_ts
-            ON stock_prices (ticker, timestamp DESC)
-        """))
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_news_articles_published
-            ON news_articles (published_date DESC)
-        """))
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_recommendations_signal
-            ON recommendations (signal)
-        """))
-        conn.commit()
+# (Schema init has been disabled at module level to prevent DDL locks during EA active sessions)
+# try:
+#     with engine.connect() as conn:
+#         pass
+# except Exception as e:
+#     print(f"Error initializing database schema: {e}")
 
-except Exception as e:
-    import traceback
-    traceback.print_exc()
-    print(f"Error initializing database schema/partitioning: {e}")
 
 # Global tracker for MT5 clients and manual overrides
 mt5_clients = {}
@@ -233,6 +132,22 @@ max_drawdown_percent = 5.0
 emergency_kill_switch = False
 last_risk_state = False
 last_risk_reason = ""
+
+# ─── Final core sync (all globals now declared) ───────────────────────────────
+import core as _core_module
+_core_module.engine = engine
+_core_module.manager = manager
+_core_module.mt5_clients = mt5_clients
+_core_module.manual_overrides = manual_overrides
+_core_module.max_drawdown_percent = max_drawdown_percent
+_core_module.emergency_kill_switch = emergency_kill_switch
+
+# ─── Register modular routers ─────────────────────────────────────────────────
+from routers.mt5 import router as _mt5_router
+from routers.tickers import router as _tickers_router
+app.include_router(_mt5_router)
+app.include_router(_tickers_router)
+
 
 class RiskSettingsPayload(BaseModel):
     max_drawdown_percent: float
@@ -295,6 +210,37 @@ class CryptoSummary(BaseModel):
     price: float
     change_pct: float
 
+class ApiKeyCreate(BaseModel):
+    label: str
+    hourly_limit: int = 0
+    daily_limit: int = 0
+
+def validate_api_key(request: Request, api_key: str = Query(None)):
+    if not api_key:
+        raise HTTPException(status_code=401, detail="API Key is missing")
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT is_active, hourly_limit, daily_limit FROM api_keys WHERE key_value = :key"), {"key": api_key}).fetchone()
+        if not row:
+            raise HTTPException(status_code=401, detail="Invalid API Key")
+        is_active, hourly_limit, daily_limit = row
+        if not is_active:
+            raise HTTPException(status_code=401, detail="API Key is disabled")
+            
+        if hourly_limit > 0:
+            count_hr = conn.execute(text("SELECT COUNT(*) FROM api_key_usage WHERE key_value = :key AND timestamp > NOW() - INTERVAL '1 hour'"), {"key": api_key}).scalar()
+            if count_hr >= hourly_limit:
+                raise HTTPException(status_code=429, detail="Hourly limit exceeded")
+                
+        if daily_limit > 0:
+            count_dy = conn.execute(text("SELECT COUNT(*) FROM api_key_usage WHERE key_value = :key AND timestamp > NOW() - INTERVAL '1 day'"), {"key": api_key}).scalar()
+            if count_dy >= daily_limit:
+                raise HTTPException(status_code=429, detail="Daily limit exceeded")
+                
+        endpoint = str(request.url.path)
+        conn.execute(text("INSERT INTO api_key_usage (key_value, endpoint) VALUES (:key, :ep)"), {"key": api_key, "ep": endpoint})
+        conn.commit()
+    return api_key
+
 class MarketSummaryResponse(BaseModel):
     indices: List[IndexSummary]
     v2tx: VolatilitySummary
@@ -328,6 +274,7 @@ class StockDetailResponse(BaseModel):
     reason_macro: Optional[str]
     reason_micro: Optional[str]
     reason_technical: Optional[str]
+    full_reason: Optional[str]
     history: List[dict]
     beta: float
     correlation: Optional[float]
@@ -509,47 +456,7 @@ def get_market_summary():
     _cache_market_summary["market_summary"] = result
     return result
 
-@app.get("/api/tickers")
-def get_tickers():
-    with engine.connect() as conn:
-        rows = conn.execute(text("SELECT ticker, name, country, sector, industry, is_active FROM companies ORDER BY is_active DESC, ticker ASC")).fetchall()
-        return [
-            {
-                "ticker": r[0],
-                "name": r[1],
-                "country": r[2],
-                "sector": r[3],
-                "industry": r[4],
-                "is_active": r[5]
-            } for r in rows
-        ]
 
-@app.post("/api/tickers/toggle")
-def toggle_ticker(payload: TickerTogglePayload):
-    with engine.connect() as conn:
-        conn.execute(text("UPDATE companies SET is_active = :is_active WHERE ticker = :ticker"), 
-                     {"is_active": payload.is_active, "ticker": payload.ticker})
-        conn.commit()
-    return {"status": "success"}
-
-@app.post("/api/tickers/add")
-def add_ticker(payload: TickerAddPayload):
-    with engine.connect() as conn:
-        exists = conn.execute(text("SELECT ticker FROM companies WHERE ticker = :ticker"), {"ticker": payload.ticker}).fetchone()
-        if exists:
-            raise HTTPException(status_code=400, detail="Ticker già esistente")
-        conn.execute(text("""
-            INSERT INTO companies (ticker, name, country, sector, industry, trust_score, is_active)
-            VALUES (:ticker, :name, :country, :sector, :industry, 0.60, TRUE)
-        """), {
-            "ticker": payload.ticker,
-            "name": payload.name,
-            "country": payload.country,
-            "sector": payload.sector,
-            "industry": payload.industry
-        })
-        conn.commit()
-    return {"status": "success"}
 
 @app.get("/api/screener", response_model=List[ScreenerRow])
 def get_screener():
@@ -609,7 +516,7 @@ def get_stock_detail(ticker: str):
         # Fetch recommendation details
         rec = conn.execute(
             text("""
-                SELECT signal, sentiment_score, price_change_24h, reason_macro, reason_micro, reason_technical, ml_prediction_prob
+                SELECT signal, sentiment_score, price_change_24h, reason_macro, reason_micro, reason_technical, full_reason, ml_prediction_prob
                 FROM recommendations
                 WHERE ticker = :ticker
             """),
@@ -622,10 +529,11 @@ def get_stock_detail(ticker: str):
         reason_macro = "No analysis available yet."
         reason_micro = "No analysis available yet."
         reason_technical = "No analysis available yet."
+        full_reason = None
         ml_prob = 0.50
         
         if rec:
-            signal, sent_score, change_24h, reason_macro, reason_micro, reason_technical, ml_prob_val = rec
+            signal, sent_score, change_24h, reason_macro, reason_micro, reason_technical, full_reason, ml_prob_val = rec
             ml_prob = float(ml_prob_val) if ml_prob_val is not None else 0.50
             
         # Fetch price history (last 100 rows for rich charts)
@@ -812,6 +720,7 @@ def get_stock_detail(ticker: str):
         # Calculate Kelly Factor specifically for the detail view
         kelly_factor = None
         chandelier_exit_distance = atr * 2.5 if atr > 0 else 0.0
+        chandelier_exit_dist = atr * 2.5 if atr > 0 else 0.0
         try:
             metrics_row = conn.execute(
                 text("SELECT accuracy FROM ml_model_metrics WHERE ticker = :ticker"),
@@ -831,13 +740,14 @@ def get_stock_detail(ticker: str):
             country=country,
             sector=sector,
             industry=industry,
-            price=latest_price,
-            price_change_24h=float(change_24h) if change_24h else 0.0,
-            sentiment_score=float(sent_score) if sent_score else 0.0,
+            price=round(latest_price, 2),
+            price_change_24h=round(change_24h, 2),
+            sentiment_score=round(float(sent_score) if sent_score else 0.0, 4),
             signal=signal,
             reason_macro=reason_macro,
             reason_micro=reason_micro,
             reason_technical=reason_technical,
+            full_reason=full_reason,
             history=history_list,
             beta=beta,
             correlation=correlation,
@@ -1332,6 +1242,7 @@ class ExecutionLogPayload(BaseModel):
 @app.get("/api/mt5/signals")
 async def get_mt5_signals(
     request: Request, 
+    api_key: str = Depends(validate_api_key),
     ticker: Optional[str] = None,
     balance: Optional[float] = None,
     equity: Optional[float] = None,
@@ -1415,6 +1326,7 @@ async def get_mt5_signals(
                         FROM stock_prices
                         WHERE close IS NOT NULL
                     ) p ON r.ticker = p.ticker AND p.rn = 1
+                    WHERE r.timestamp >= NOW() - INTERVAL '2 hours'
                     ORDER BY r.timestamp DESC
                 """)
             ).fetchall()
@@ -1746,57 +1658,7 @@ async def set_override(payload: OverridePayload, current_user: dict = Depends(ge
     await manager.broadcast({"type": "overrides_update"})
     return {"status": "success", "overrides": manual_overrides}
 
-@app.post("/api/mt5/positions")
-async def sync_mt5_positions(payload: PositionsPayload):
-    try:
-        with engine.connect() as conn:
-            for pos in payload.positions:
-                conn.execute(text("""
-                    INSERT INTO live_positions (ticker, quantity, avg_price, current_price, unrealized_pnl, updated_at)
-                    VALUES (:ticker, :qty, :avg_price, :current_price, :pnl, NOW())
-                    ON CONFLICT (ticker) DO UPDATE SET 
-                        quantity = EXCLUDED.quantity,
-                        avg_price = EXCLUDED.avg_price,
-                        current_price = EXCLUDED.current_price,
-                        unrealized_pnl = EXCLUDED.unrealized_pnl,
-                        updated_at = NOW();
-                """), {
-                    "ticker": pos.ticker,
-                    "qty": pos.quantity,
-                    "avg_price": pos.avg_price,
-                    "current_price": pos.current_price,
-                    "pnl": pos.unrealized_pnl
-                })
-            conn.commit()
-            
-            await manager.broadcast({"type": "positions_update"})
-            return {"status": "ok"}
-    except Exception as e:
-        print(f"Error syncing positions: {e}")
-        raise HTTPException(status_code=500, detail="Database error")
 
-@app.post("/api/mt5/execution-log")
-async def sync_execution_log(payload: ExecutionLogPayload):
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("""
-                INSERT INTO execution_logs (ticker, action, quantity, fill_price, slippage, broker, timestamp)
-                VALUES (:ticker, :action, :qty, :fill_price, :slippage, :broker, NOW())
-            """), {
-                "ticker": payload.ticker,
-                "action": payload.action,
-                "qty": payload.quantity,
-                "fill_price": payload.fill_price,
-                "slippage": payload.slippage,
-                "broker": payload.broker
-            })
-            conn.commit()
-            
-            await manager.broadcast({"type": "execution_logs_update"})
-            return {"status": "ok"}
-    except Exception as e:
-        print(f"Error saving execution log: {e}")
-        raise HTTPException(status_code=500, detail="Database error")
 
 @app.get("/api/backtest/results")
 def get_backtest_results():
@@ -1852,82 +1714,7 @@ def get_recommendations_history(ticker: str):
         )
     return history
 
-@app.get("/api/mt5/risk")
-def get_risk_settings():
-    # Calculate current aggregate drawdown and fetch all accounts
-    with engine.connect() as conn:
-        acc_stats = conn.execute(text("SELECT SUM(balance), SUM(equity) FROM broker_accounts")).fetchone()
-        current_drawdown_pct = 0.0
-        if acc_stats and acc_stats[0] and float(acc_stats[0]) > 0:
-            total_bal = float(acc_stats[0])
-            total_eq = float(acc_stats[1])
-            if total_bal > total_eq:
-                current_drawdown_pct = ((total_bal - total_eq) / total_bal) * 100.0
-                
-        accounts_rows = conn.execute(text("SELECT account_id, broker, balance, equity, profit, max_drawdown_percent FROM broker_accounts")).fetchall()
-        accounts_data = []
-        for r in accounts_rows:
-            acc_id, broker, bal, eq, prof, max_dd = r
-            bal_val = float(bal) if bal else 0.0
-            eq_val = float(eq) if eq else 0.0
-            dd = ((bal_val - eq_val) / bal_val * 100.0) if bal_val > eq_val and bal_val > 0 else 0.0
-            accounts_data.append({
-                "account_id": acc_id,
-                "broker": broker or "Unknown",
-                "balance": bal_val,
-                "equity": eq_val,
-                "profit": float(prof) if prof else 0.0,
-                "max_drawdown_percent": float(max_dd) if max_dd is not None else 5.0,
-                "current_drawdown_percent": round(dd, 2)
-            })
-                
-    return {
-        "max_drawdown_percent": max_drawdown_percent,
-        "emergency_kill_switch": emergency_kill_switch,
-        "current_drawdown_percent": round(current_drawdown_pct, 2),
-        "accounts": accounts_data
-    }
 
-@app.post("/api/mt5/risk")
-async def update_risk_settings(request: Request, payload: RiskSettingsPayload, current_user: dict = Depends(require_admin)):
-    """Admin only: updates global max drawdown risk threshold."""
-    global max_drawdown_percent
-    max_drawdown_percent = payload.max_drawdown_percent
-    ip = request.client.host if request.client else "unknown"
-    write_audit_log(current_user["username"], "risk_settings_updated",
-                    {"max_drawdown_percent": payload.max_drawdown_percent}, ip)
-    send_system_notifications(f"🛡️ <b>EuroQuant Risk System</b>\nMax drawdown limit updated to {max_drawdown_percent}% by admin user <b>{current_user['username']}</b>.")
-    await manager.broadcast({"type": "risk_update"})
-    return {"status": "success", "max_drawdown_percent": max_drawdown_percent}
-
-@app.post("/api/mt5/risk/kill-switch")
-async def toggle_kill_switch(request: Request, payload: KillSwitchPayload, current_user: dict = Depends(require_admin)):
-    """Admin only: activates or deactivates the emergency kill switch."""
-    global emergency_kill_switch
-    emergency_kill_switch = payload.active
-    ip = request.client.host if request.client else "unknown"
-    write_audit_log(current_user["username"], "kill_switch_toggled",
-                    {"active": payload.active}, ip)
-    status_text = "ATTIVATO" if emergency_kill_switch else "DISATTIVATO"
-    send_system_notifications(f"⚠️ <b>EuroQuant EMERGENCY ALERT</b>\nKill switch <b>{status_text}</b> by admin user <b>{current_user['username']}</b>!")
-    await manager.broadcast({"type": "risk_update"})
-    return {"status": "success", "emergency_kill_switch": emergency_kill_switch}
-
-@app.post("/api/mt5/accounts/{account_id}/risk")
-async def update_account_risk_settings(account_id: str, request: Request, payload: AccountRiskPayload, current_user: dict = Depends(require_admin)):
-    """Admin only: updates per-account drawdown limit."""
-    with engine.connect() as conn:
-        conn.execute(
-            text("UPDATE broker_accounts SET max_drawdown_percent = :max_dd WHERE account_id = :account_id"),
-            {"max_dd": payload.max_drawdown_percent, "account_id": account_id}
-        )
-        conn.commit()
-    ip = request.client.host if request.client else "unknown"
-    write_audit_log(current_user["username"], "account_risk_updated",
-                    {"account_id": account_id, "max_drawdown_percent": payload.max_drawdown_percent}, ip)
-    send_system_notifications(f"🛡️ <b>EuroQuant Risk System</b>\nAccount <code>{account_id}</code> drawdown limit updated to {payload.max_drawdown_percent}% by admin <b>{current_user['username']}</b>.")
-    await manager.broadcast({"type": "risk_update"})
-    return {"status": "success", "account_id": account_id, "max_drawdown_percent": payload.max_drawdown_percent}
 
 class SystemSettingsPayload(BaseModel):
     telegram_bot_token: str
@@ -3047,6 +2834,103 @@ def get_live_positions(current_user: str = Depends(get_current_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/keys")
+def get_api_keys():
+    try:
+        with engine.connect() as conn:
+            keys = conn.execute(text("SELECT key_id, key_value, label, is_active, hourly_limit, daily_limit, created_at FROM api_keys ORDER BY created_at DESC")).fetchall()
+            return {
+                "status": "success",
+                "keys": [
+                    {
+                        "key_id": str(k[0]),
+                        "key_value": k[1],
+                        "label": k[2],
+                        "is_active": k[3],
+                        "hourly_limit": k[4],
+                        "daily_limit": k[5],
+                        "created_at": k[6].isoformat() if k[6] else None
+                    }
+                    for k in keys
+                ]
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/keys")
+def create_api_key(payload: ApiKeyCreate):
+    import secrets
+    new_key = "EQ-" + secrets.token_hex(16)
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("INSERT INTO api_keys (key_value, label, is_active, hourly_limit, daily_limit) VALUES (:val, :lbl, TRUE, :hl, :dl)"),
+                {"val": new_key, "lbl": payload.label, "hl": payload.hourly_limit, "dl": payload.daily_limit}
+            )
+            conn.commit()
+            return {"status": "success", "message": "API Key created", "key": new_key}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/keys/{key_value}/toggle")
+def toggle_api_key(key_value: str):
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("UPDATE api_keys SET is_active = NOT is_active WHERE key_value = :key"),
+                {"key": key_value}
+            )
+            conn.commit()
+            return {"status": "success", "message": "API Key toggled"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/keys/{key_value}")
+def delete_api_key(key_value: str):
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("DELETE FROM api_keys WHERE key_value = :key"),
+                {"key": key_value}
+            )
+            conn.commit()
+            return {"status": "success", "message": "API Key deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/keys/{key_value}/stats")
+def get_api_key_stats(key_value: str):
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT key_id FROM api_keys WHERE key_value = :key"), {"key": key_value}).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Key not found")
+                
+            total = conn.execute(text("SELECT COUNT(*) FROM api_key_usage WHERE key_value = :key"), {"key": key_value}).scalar()
+            last_hr = conn.execute(text("SELECT COUNT(*) FROM api_key_usage WHERE key_value = :key AND timestamp > NOW() - INTERVAL '1 hour'"), {"key": key_value}).scalar()
+            last_day = conn.execute(text("SELECT COUNT(*) FROM api_key_usage WHERE key_value = :key AND timestamp > NOW() - INTERVAL '1 day'"), {"key": key_value}).scalar()
+            
+            breakdown_query = text("""
+                SELECT DATE(timestamp) as d, COUNT(*) 
+                FROM api_key_usage 
+                WHERE key_value = :key AND timestamp >= NOW() - INTERVAL '7 days'
+                GROUP BY d 
+                ORDER BY d ASC
+            """)
+            daily_rows = conn.execute(breakdown_query, {"key": key_value}).fetchall()
+            daily_breakdown = [{"date": str(r[0]), "count": r[1]} for r in daily_rows]
+            
+            return {
+                "status": "success",
+                "total_usage": total,
+                "last_hour": last_hr,
+                "last_day": last_day,
+                "daily_breakdown": daily_breakdown
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 @app.get("/api/execution-logs")
 def get_execution_logs(current_user: str = Depends(get_current_user)):
     try:
@@ -3080,113 +2964,3 @@ def get_execution_logs(current_user: str = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
 
 # --- MT5 INTEGRATION ENDPOINTS ---
-
-class MT5Position(BaseModel):
-    ticker: str
-    quantity: float
-    avg_price: float
-    current_price: float
-    unrealized_pnl: float
-
-class MT5PositionsPayload(BaseModel):
-    positions: List[MT5Position]
-
-class MT5ExecutionLog(BaseModel):
-    ticker: str
-    action: str
-    quantity: float
-    fill_price: float
-    slippage: float = 0.0
-
-@app.get("/api/mt5/signals")
-def get_mt5_signals(balance: float = 0.0, equity: float = 0.0, margin: float = 0.0, margin_free: float = 0.0):
-    try:
-        with engine.connect() as conn:
-            # We return recommendations combined with portfolio weights to generate target actions
-            # For simplicity, returning just the latest BUY/SELL recommendations
-            signals = conn.execute(
-                text("""
-                SELECT ticker, signal, volatility_lot_sizing
-                FROM recommendations
-                WHERE timestamp >= NOW() - INTERVAL '1 day'
-                  AND signal IN ('BUY', 'SELL')
-                """)
-            ).fetchall()
-            
-            result = []
-            for s in signals:
-                ticker = s[0]
-                action = s[1]
-                vol_lot = s[2] if s[2] else 1.0
-                
-                # Fetch basic price info to formulate SL/TP roughly for EA
-                price_row = conn.execute(
-                    text("SELECT close FROM stock_prices WHERE ticker = :ticker ORDER BY timestamp DESC LIMIT 1"),
-                    {"ticker": ticker}
-                ).fetchone()
-                
-                current_price = float(price_row[0]) if price_row else 100.0
-                sl = current_price * 0.95 if action == 'BUY' else current_price * 1.05
-                tp = current_price * 1.10 if action == 'BUY' else current_price * 0.90
-                
-                result.append({
-                    "ticker": ticker,
-                    "mt5_symbol": ticker, # MT5 EA will resolve this using ResolveMt5Symbol
-                    "action": action,
-                    "entry_price": str(current_price),
-                    "stop_loss": str(sl),
-                    "take_profit": str(tp),
-                    "reason": "AI Generated Signal",
-                    "volatility_lot_sizing": str(vol_lot)
-                })
-                
-            return result # MT5 EA expects an array of objects directly
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/mt5/positions")
-def update_mt5_positions(payload: MT5PositionsPayload):
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("TRUNCATE TABLE live_positions"))
-            
-            for pos in payload.positions:
-                conn.execute(
-                    text("""
-                    INSERT INTO live_positions (ticker, quantity, avg_price, current_price, unrealized_pnl)
-                    VALUES (:ticker, :quantity, :avg_price, :current_price, :unrealized_pnl)
-                    """),
-                    {
-                        "ticker": pos.ticker,
-                        "quantity": pos.quantity,
-                        "avg_price": pos.avg_price,
-                        "current_price": pos.current_price,
-                        "unrealized_pnl": pos.unrealized_pnl
-                    }
-                )
-            conn.commit()
-            return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/mt5/execution-log")
-def log_mt5_execution(payload: MT5ExecutionLog):
-    try:
-        with engine.connect() as conn:
-            conn.execute(
-                text("""
-                INSERT INTO execution_logs (ticker, action, quantity, fill_price, slippage, broker)
-                VALUES (:ticker, :action, :quantity, :fill_price, :slippage, 'mt5')
-                """),
-                {
-                    "ticker": payload.ticker,
-                    "action": payload.action,
-                    "quantity": payload.quantity,
-                    "fill_price": payload.fill_price,
-                    "slippage": payload.slippage
-                }
-            )
-            conn.commit()
-            return {"status": "success"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))

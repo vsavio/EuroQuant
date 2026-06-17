@@ -5,7 +5,7 @@ All /api/mt5/* endpoints.
 Imports shared state from core.py — no circular dependency.
 """
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import text
 
 from core import engine, manager, manual_overrides, send_system_notifications
@@ -77,7 +77,9 @@ def get_broker_accounts():
 
 
 @router.post("/positions")
-async def sync_mt5_positions(payload: PositionsPayload):
+async def sync_mt5_positions(payload: PositionsPayload, request: Request, api_key: str = None):
+    from main import validate_api_key
+    validate_api_key(request, api_key)
     try:
         with engine.connect() as conn:
             for pos in payload.positions:
@@ -104,7 +106,9 @@ async def sync_mt5_positions(payload: PositionsPayload):
 
 
 @router.post("/execution-log")
-async def sync_execution_log(payload: ExecutionLogPayload):
+async def sync_execution_log(payload: ExecutionLogPayload, request: Request, api_key: str = None):
+    from main import validate_api_key
+    validate_api_key(request, api_key)
     try:
         with engine.connect() as conn:
             conn.execute(text("""
